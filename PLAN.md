@@ -118,4 +118,6 @@ aisaas_costping/
 - Next.js + Supabase 웹 대시보드, 구독 CRUD UI
 - KST 정밀 일 경계 (시간 단위 버킷 집계)
 - 월 예산 초과 경고, 주간/월간 요약 리포트
-- Google/기타 제공사 추가
+- **Google Gemini API 비용 추가** (2026-07-27 조사): Anthropic/OpenAI처럼 간단한 Admin API 키로 비용 조회 불가. AI Studio 대시보드 전용, 프로그래밍 조회는 GCP Cloud Billing BigQuery Export 구축 필요(별도 GCP 프로젝트 연결 + 서비스 계정 + BigQuery 쿼리) — MVP 아키텍처(서버 없는 GitHub Actions 스크립트)와 무게감이 다름
+- **Voyage AI 비용 추가** (2026-07-27 조사): MongoDB Atlas 산하로 통합됨. 공개 REST 비용/사용량 API 없음, Atlas UI(Usage/Cost Explorer/Invoices)로만 확인 가능. 프로그래밍 연동은 MongoDB에 별도 문의 필요
+- 기타 제공사 추가
