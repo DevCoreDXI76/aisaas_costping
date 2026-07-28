@@ -111,16 +111,26 @@ def build_cost_section() -> str:
     return "\n".join(lines)
 
 
+def _build_subscription_section_safe() -> str:
+    """subscriptions.json이 없거나 형식이 깨져 있어도 비용 섹션은 정상 발송되도록
+    여기서 예외를 흡수한다 (build_cost_section과 동일한 방어 패턴)."""
+    try:
+        subs = subs_mod.load_subscriptions()
+        due_today, due_tomorrow = subs_mod.get_due_today_and_tomorrow(subs)
+        return build_subscription_section(due_today, due_tomorrow)
+    except FileNotFoundError:
+        return "⚠️ 구독 정보 조회 건너뜀: subscriptions.json 파일이 없습니다."
+    except Exception as e:
+        return f"⚠️ 구독 정보 조회 실패: {e}"
+
+
 def build_report() -> str:
     now = datetime.now(KST)
     weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][now.weekday()]
     header = f"📊 CostPing — {now.month}/{now.day}({weekday_kr})"
 
     cost_section = build_cost_section()
-
-    subs = subs_mod.load_subscriptions()
-    due_today, due_tomorrow = subs_mod.get_due_today_and_tomorrow(subs)
-    subscription_section = build_subscription_section(due_today, due_tomorrow)
+    subscription_section = _build_subscription_section_safe()
 
     return f"{header}\n\n{cost_section}\n\n{subscription_section}"
 
