@@ -3,7 +3,7 @@
 > AI API 비용 + 구독 결제일을 매일 아침 8시(KST) 텔레그램으로 받는 개인 도구.
 > 서버·DB 없음: GitHub Actions cron → Python 스크립트 → Telegram Bot API.
 
-작성일: 2026-07-27 · 상태: **세션 0 시작 전** (준비물 없음, 완전 초기)
+작성일: 2026-07-27 · 상태: **1단계 MVP 완료 + 2단계 세션 1(예산 경고/주간·월간 요약) 진행 중**
 
 ---
 
@@ -33,8 +33,11 @@ aisaas_costping/
 │  │  ├─ anthropic_cost.py
 │  │  └─ openai_cost.py
 │  ├─ subscriptions.py     # 결제일 계산 (오늘/내일, 말일 처리)
+│  ├─ budget.py            # 월 예산 초과 경고 (2단계 세션 1)
+│  ├─ weekly_monthly.py    # 주간/월간 요약 날짜 범위 계산 (2단계 세션 1)
 │  └─ telegram.py          # 발송 + 에러 알림
 ├─ subscriptions.json
+├─ budget.json              # 월 예산 한도 설정 (2단계 세션 1)
 ├─ PLAN.md                 # 이 문서
 └─ README.md
 ```
@@ -117,7 +120,29 @@ aisaas_costping/
 
 - Next.js + Supabase 웹 대시보드, 구독 CRUD UI
 - KST 정밀 일 경계 (시간 단위 버킷 집계)
-- 월 예산 초과 경고, 주간/월간 요약 리포트
 - **Google Gemini API 비용 추가** (2026-07-27 조사): Anthropic/OpenAI처럼 간단한 Admin API 키로 비용 조회 불가. AI Studio 대시보드 전용, 프로그래밍 조회는 GCP Cloud Billing BigQuery Export 구축 필요(별도 GCP 프로젝트 연결 + 서비스 계정 + BigQuery 쿼리) — MVP 아키텍처(서버 없는 GitHub Actions 스크립트)와 무게감이 다름
 - **Voyage AI 비용 추가** (2026-07-27 조사): MongoDB Atlas 산하로 통합됨. 공개 REST 비용/사용량 API 없음, Atlas UI(Usage/Cost Explorer/Invoices)로만 확인 가능. 프로그래밍 연동은 MongoDB에 별도 문의 필요
 - 기타 제공사 추가
+
+> ~~월 예산 초과 경고, 주간/월간 요약 리포트~~ → 2단계 세션 1에서 완료 (아래 7번 참고)
+
+## 7. 2단계 진행 로그
+
+### 2단계 세션 1 — 월 예산 초과 경고 + 주간/월간 요약 (2026-07-28)
+- [x] `budget.json` + `src/budget.py`: 이번 달 API 비용이 `monthly_budget_usd`의
+      `warning_threshold_pct`(기본 80%)를 넘으면 ⚠️, 100%를 넘으면 🚨 경고를 리포트에 추가.
+      파일이 없거나 한도 0이면 조용히 생략(옵트인 기능).
+- [x] `src/weekly_monthly.py` + `src/providers/*.get_cost_for_range()`: 별도 cron/DB 없이 기존
+      매일 08:00 실행에 조건부로 "매주 월요일 → 지난주 요약", "매월 1일 → 지난달 요약" 섹션 추가.
+- [x] `src/report.py`에 통합, 기존 방어 패턴(제공사 개별 실패해도 나머지 정상 발송)을 새 섹션에도
+      동일 적용.
+- ✅ 완료 기준: 로컬에서 provider 함수를 mock해 평일/월요일/1일 케이스, budget.json 없음/깨짐/한도 0
+      케이스를 모두 검증(정상 동작 확인). 실제 배포는 사용자가 GitHub에 커밋/푸시 + Actions 수동
+      실행(workflow_dispatch)으로 최종 확인 필요.
+- 📝 다음에 이어갈 것: `budget.json`의 `monthly_budget_usd`(기본값 50) 실제 지출 규모에 맞게 조정.
+- [x] (추가 조정, 2026-07-28) 실배포 확인 결과 이번 달 누적이 기본 한도($50)를 이미 넘어서 있어,
+      사용자 요청으로 `budget.json`에 `daily_budget_usd`(하루 $5)를 추가하고 `monthly_budget_usd`를
+      $60으로 조정. `src/budget.py`가 하루/월 한도를 각각 독립적으로 체크하도록 리팩터링
+      (`build_budget_warnings()`가 0~2줄 경고를 반환), `src/report.py`의 `build_cost_section()`이
+      어제 하루 비용도 함께 반환하도록 변경. 실제 사용자 리포트 숫자($5.94/$71.27)로 재현 테스트해
+      하루·월 두 경고가 모두 정상 표시됨을 확인.
