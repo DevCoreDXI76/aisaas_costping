@@ -1,5 +1,6 @@
 """
-CostPing 진입점 (2단계 세션 1 버전: 세션3 MVP + 월 예산 초과 경고 + 주간/월간 요약).
+CostPing 진입점 (2단계 세션 2C 버전: MVP + 월 예산 초과 경고 + 주간/월간 요약
++ KST 정밀 어제 비용(실험적)).
 
 로컬 테스트:
   1) 프로젝트 루트에 .env 파일을 만들고 아래처럼 채운다 (커밋 금지, .gitignore에 포함됨)
@@ -15,6 +16,12 @@ GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로
   - budget.json 기반 월 예산 초과 경고 (src/budget.py)
   - 매주 월요일에 "지난주 요약", 매월 1일에 "지난달 요약" 섹션 자동 추가
     (src/weekly_monthly.py) — 별도 cron 없이 기존 매일 08:00 실행에 조건부로 얹는다.
+  - "🧪 KST 정밀 어제 비용 (실험적)" 섹션 (세션 2C): 기존 "어제 API 비용 (UTC 기준)"
+    섹션을 대체하는 게 아니라 그 아래에 나란히 추가된다. Usage API + prices.json
+    간소화판 단가표로 계산하므로 cost_report 기반 숫자보다 근사치가 섞일 수 있고,
+    그 경우 경고 문구가 같이 표시된다(src/providers/{anthropic_cost,openai_cost}.py의
+    get_kst_precise_cost_for_day). 두 제공사 다 조회에 실패하면 이 섹션 자체가
+    조용히 생략된다 — 실험 기능 하나 때문에 핵심 리포트에 에러를 노출하지 않기 위함.
 """
 
 import os
@@ -200,6 +207,60 @@ def _build_monthly_section_safe(today) -> str | None:
         return f"⚠️ 지난달 요약 생성 실패: {e}"
 
 
+def _fetch_provider_kst_precise_cost(provider_module, config_error_cls, kst_date):
+    """KST 정밀(실험적) 비용 조회 헬퍼. 성공하면 (cost_usd, warnings, None),
+    실패하면 (0, [], 경고문구)를 반환한다. _fetch_provider_cost와 동일한 방어 패턴."""
+    try:
+        cost, warnings = provider_module.get_kst_precise_cost_for_day(kst_date)
+        return cost, warnings, None
+    except config_error_cls as e:
+        return 0.0, [], f"건너뜀: {e}"
+    except Exception as e:
+        return 0.0, [], f"조회 실패: {e}"
+
+
+def _build_kst_precise_section_safe(today) -> str | None:
+    """
+    [실험적, 2단계 세션 2C] KST 정밀 어제 비용 섹션. 기존 "어제 API 비용 (UTC 기준)"
+    섹션과 나란히 추가되는 것이지 그걸 대체하는 게 아니다 — Usage API + 간소화판
+    단가표(prices.json) 기반이라 cost_report보다 근사치가 섞일 수 있다(경고로 표시됨).
+
+    두 제공사 다 실패하면 이 실험적 섹션 자체를 조용히 생략한다(핵심 UTC 섹션은 이미
+    따로 있으니 실험 기능 하나 때문에 눈에 띄는 에러를 보여줄 필요는 없다는 판단).
+    """
+    try:
+        yesterday_kst = today - timedelta(days=1)
+        a_cost, a_warnings, a_error = _fetch_provider_kst_precise_cost(
+            anthropic_cost, anthropic_cost.AnthropicConfigError, yesterday_kst
+        )
+        o_cost, o_warnings, o_error = _fetch_provider_kst_precise_cost(
+            openai_cost, openai_cost.OpenAIConfigError, yesterday_kst
+        )
+
+        if a_error and o_error:
+            return None
+
+        lines = [f"🧪 KST 정밀 어제 비용 (실험적, {yesterday_kst})"]
+        if a_error:
+            lines.append(f"· Anthropic  ⚠️ {a_error}")
+        else:
+            lines.append(f"· Anthropic  {format_currency(a_cost, 'USD')}")
+        if o_error:
+            lines.append(f"· OpenAI     ⚠️ {o_error}")
+        else:
+            lines.append(f"· OpenAI     {format_currency(o_cost, 'USD')}")
+
+        note = " (일부 제공사 조회 실패, 부분 합계)" if (a_error or o_error) else ""
+        lines.append(f"· 합계        {format_currency(a_cost + o_cost, 'USD')}{note}")
+
+        for w in a_warnings + o_warnings:
+            lines.append(f"  ⚠️ {w}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"⚠️ KST 정밀 비용(실험적) 계산 실패: {e}"
+
+
 def build_report() -> str:
     now = datetime.now(KST)
     today = now.date()
@@ -215,6 +276,10 @@ def build_report() -> str:
         budget_text = budget.build_budget_section_safe(yesterday_total, month_total)
         if budget_text:
             sections.append(budget_text)
+
+    kst_precise_text = _build_kst_precise_section_safe(today)
+    if kst_precise_text:
+        sections.append(kst_precise_text)
 
     sections.append(subscription_section)
 

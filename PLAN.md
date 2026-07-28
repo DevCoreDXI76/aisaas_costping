@@ -3,7 +3,7 @@
 > AI API 비용 + 구독 결제일을 매일 아침 8시(KST) 텔레그램으로 받는 개인 도구.
 > 서버·DB 없음: GitHub Actions cron → Python 스크립트 → Telegram Bot API.
 
-작성일: 2026-07-27 · 상태: **1단계 MVP 완료 + 2단계 세션 1(예산 경고/주간·월간 요약) 진행 중**
+작성일: 2026-07-27 · 상태: **1단계 MVP 완료 + 2단계 세션 1(예산 경고/주간·월간 요약)·세션 2(KST 정밀 비용, 실험적) 완료**
 
 ---
 
@@ -124,7 +124,8 @@ aisaas_costping/
 - 기타 제공사 추가
 
 > ~~월 예산 초과 경고, 주간/월간 요약 리포트~~ → 2단계 세션 1에서 완료 (아래 7번 참고)
-> KST 정밀 일 경계는 2단계 세션 2로 승격되어 진행 중 (아래 7번, "세션 2" 참고) — 백로그 목록에서 제외.
+> ~~KST 정밀 일 경계~~ → 2단계 세션 2(세션 A~C)에서 완료. "🧪 KST 정밀 어제 비용(실험적)" 섹션으로
+> report.py에 통합됨(기존 UTC 섹션과 나란히 공존, 아래 7번 참고).
 
 ## 7. 2단계 진행 로그
 
@@ -181,11 +182,55 @@ aisaas_costping/
       Usage API를 호출하는 코드는 없음 — 실제 API 응답 형태(정확한 모델 ID 문자열, 필드명)를
       모르는 채로 어댑터를 짜는 게 더 위험하다고 판단해 다음 세션으로 미룸.
 
-**다음 세션 계획**:
-- **세션 B**: Anthropic Usage API(`usage_report/messages`) 실제 연동. 실제 응답을 보고
-  (1) 모델 ID 문자열이 `prices.json`의 접두사와 맞는지 확인/수정, (2) `service_tier`/`context_window`
-  같은 필드로 배치·20만 토큰 초과 사용량을 감지해 경고 로직 완성. 이때까진 이 기능을 report.py에
-  연결하지 않고 별도로 실행/검증만 한다(기존 리포트 발송 경로는 안 건드림).
-- **세션 C**: OpenAI Usage API 연동 + `report.py`에 "KST 정밀 어제 비용(실험적)"로 **기존 UTC 섹션과
-  나란히 추가**(교체 아님). 며칠 지켜보며 콘솔의 실제 청구 금액과 비교해 신뢰할 수 있다고 판단되면
-  그때 기존 UTC 기준 섹션을 대체할지 결정.
+**세션 B 완료 (2026-07-28)**: Anthropic Usage API 실제 연동.
+- [x] `scripts/explore_anthropic_usage.py`로 실제 응답 확인. 실제 등장한 모델 ID:
+      `claude-sonnet-5`(접미사 없음), `claude-sonnet-4-6`(접미사 없음),
+      `claude-haiku-4-5-20251001`(날짜 접미사 있음) — 셋 다 `prices.json`의 기존 접두사
+      (`claude-sonnet-5`/`claude-sonnet-4`/`claude-haiku-4`)와 겹치지 않고 정확히 매칭됨,
+      단가표 수정 불필요.
+- [x] 실제 응답 스키마 확인: `cache_creation`이 `{ephemeral_1h_input_tokens, ephemeral_5m_input_tokens}`
+      중첩 객체로 옴(당초 가정한 단일 `cache_creation_input_tokens` 필드가 아니었음). 이번 사용자
+      샘플에서는 `service_tier`/`context_window`가 전부 `null`(배치·20만 토큰 초과 없음).
+- [x] `src/providers/anthropic_cost.py`에 `get_kst_precise_cost_for_day(kst_date)` 추가:
+      `kst_bucket.kst_day_to_utc_range()`로 계산한 UTC 24시간 구간을 `usage_report/messages`에
+      `bucket_width=1h`로 질의 → 모델별로 `pricing.calc_anthropic_cost_usd()`로 환산 → 합산.
+      1시간 캐시 쓰기·`service_tier`≠standard·`context_window` 존재·웹 검색 도구 사용을 감지하면
+      경고 문구를 남기고(그 부분은 비용 계산에서 제외 또는 근사치), 단가표에 없는 모델을 만나도
+      죽지 않는다(`pricing.CostAccumulator`).
+- [x] 사용자가 붙여넣은 실제 응답 1건 + 1시간 캐시/batch/context_window/웹검색/미등록 모델을 모두
+      포함한 합성 케이스로 재현 테스트 — 수기 검산과 정확히 일치, 경고 5종 모두 정상 트리거 확인.
+- ✅ 완료 기준: `python src/providers/anthropic_cost.py` 실행 시 기존 UTC 기준 값과 새 KST 정밀
+      (실험적) 값이 나란히 출력됨. **아직 report.py에는 연결 안 함** — 다음 세션 전에 사용자가 며칠
+      실행해보며 콘솔 실제 청구액과 비교해볼 것.
+- 🐛 **버그 발견+수정**: `anthropic_cost.py`를 report.py 경유 없이 단독 실행하면 `.env`를 안 읽어서
+  `ANTHROPIC_ADMIN_KEY` 없음 에러가 났음(세션 B에서 처음 단독 실행하며 발견 — 원래부터 있던 결함).
+  report.py와 동일한 `_load_dotenv_if_present()`를 추가해 수정, 재실행으로 확인 완료.
+- 사용자가 실제로 돌려본 결과(2026-07-28): UTC 어제 $5.94 vs KST 정밀(실험적) $6.35 — 서로 다른
+  24시간 창(UTC 자정 vs KST 자정)이라 다른 게 정상. 경고 2건 실제 트리거(1시간 캐시 18,126토큰
+  미반영, 웹 검색 10회 미반영) — 이 사용자는 1시간 캐시를 실제로 쓰고 있어 간소화판의 근사치 갭이
+  0이 아님을 확인.
+
+**세션 C 완료 (2026-07-28)**: OpenAI Usage API 연동 + report.py 통합.
+- [x] `src/providers/openai_cost.py`에 `get_kst_precise_cost_for_day(kst_date)` 추가.
+      `GET /v1/organization/usage/completions`를 `bucket_width=1h`로 조회 → 모델별
+      `pricing.calc_openai_cost_usd()`로 환산. 오디오 토큰(입력/출력)·batch 처리·기본이 아닌
+      `service_tier`를 감지하면 경고를 남기고 그 부분은 계산에서 제외. **batch 감지 시 경고 방향이
+      Anthropic 쪽과 반대**라는 점 문서화함 — batch는 실제로 50% 할인이라, 감지되면 이 함수의
+      계산값이 오히려 실제보다 **높게**(과대 계상) 나올 수 있음.
+  - 이 함수도 단독 실행 시 `.env`가 안 읽히는 문제를 처음부터 방지하도록 `_load_dotenv_if_present()`를
+    같이 추가함(세션 B에서 발견한 버그를 미리 반영).
+- [x] `report.py`에 `_build_kst_precise_section_safe()` 추가, "🧪 KST 정밀 어제 비용 (실험적)"
+      섹션을 기존 "어제 API 비용 (UTC 기준)" 섹션 바로 아래(예산 경고 다음, 구독 알림 이전)에
+      **나란히** 추가(교체 아님). 두 제공사 다 조회 실패하면 이 실험적 섹션 자체를 조용히 생략해서,
+      실험 기능 하나 때문에 핵심 리포트에 눈에 띄는 에러가 뜨지 않게 함(한쪽만 실패하면 "부분 합계"로
+      표시 — 기존 UTC 섹션·주간/월간 요약과 동일한 방어 패턴).
+- [x] 합성 데이터로 OpenAI 계산 정확성(수기 검산 일치, 오디오/batch/service_tier/미등록 모델 경고
+      트리거) 검증, `report.py` 전체 발송 경로에서 정상 케이스·두 제공사 다 실패·한쪽만 실패 3가지
+      시나리오 모두 재현 테스트 통과.
+- ✅ 완료 기준: `report.py`가 실행되면 UTC 섹션 바로 아래 KST 정밀(실험적) 섹션이 붙어서 발송됨.
+      실제 OpenAI 계정으로는 아직 검증 안 함(사용자가 OpenAI Admin 키로 실행해서 확인 필요).
+
+**2단계 세션 2 전체 완료.** 다음 2단계 작업은 남은 백로그(6번 항목: Next.js+Supabase 대시보드,
+Gemini/Voyage AI 비용, ChatGPT 구독 추가) 중에서 고르면 된다. "KST 정밀 어제 비용(실험적)" 섹션이
+며칠 지켜봐서 신뢰할 수 있다고 판단되면, 그때 기존 "어제 API 비용 (UTC 기준)" 섹션을 이걸로 대체할지
+별도로 결정한다(지금은 나란히 공존하는 상태).

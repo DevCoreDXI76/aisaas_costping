@@ -8,8 +8,12 @@ AI API 비용 + 구독 결제일을 매일 아침 8시(KST) 텔레그램으로 �
 ```
 GitHub Actions (cron, 매일 23:00 UTC = 08:00 KST)
   └─ src/report.py
-       ├─ src/providers/anthropic_cost.py  → 어제/이달/기간별 Anthropic 비용
-       ├─ src/providers/openai_cost.py     → 어제/이달/기간별 OpenAI 비용
+       ├─ src/providers/anthropic_cost.py  → 어제/이달/기간별 Anthropic 비용 (UTC 기준)
+       │    └─ get_kst_precise_cost_for_day → KST 정밀 비용(실험적, Usage API+단가표)
+       ├─ src/providers/openai_cost.py     → 어제/이달/기간별 OpenAI 비용 (UTC 기준)
+       │    └─ get_kst_precise_cost_for_day → KST 정밀 비용(실험적, Usage API+단가표)
+       ├─ src/pricing.py + prices.json     → KST 정밀 비용 계산용 간소화판 단가표
+       ├─ src/kst_bucket.py                → KST 캘린더 날짜 ↔ UTC 시간 변환
        ├─ src/budget.py + budget.json      → 월 예산 초과 경고
        ├─ src/weekly_monthly.py            → 매주 월요일 "지난주 요약",
        │                                      매월 1일 "지난달 요약" 추가
@@ -30,12 +34,14 @@ aisaas_costping/
 │  ├─ subscriptions.py      # 결제일 계산 (오늘/내일, 말일 처리)
 │  ├─ budget.py             # 월 예산 초과 경고
 │  ├─ weekly_monthly.py     # 주간/월간 요약 날짜 범위 계산
-│  ├─ pricing.py            # (실험적, 미연결) KST 정밀 비용 계산기 — 아래 참고
-│  ├─ kst_bucket.py         # (실험적, 미연결) KST 캘린더 날짜 ↔ UTC 시간 변환
+│  ├─ pricing.py            # KST 정밀 비용 계산기(간소화판 단가표 기반) — 아래 참고
+│  ├─ kst_bucket.py         # KST 캘린더 날짜 ↔ UTC 시간 변환
 │  └─ telegram.py           # 발송 + 에러 알림
+├─ scripts/
+│  └─ explore_anthropic_usage.py  # Usage API 응답 확인용 1회성 탐색 스크립트(파이프라인 아님)
 ├─ subscriptions.json
 ├─ budget.json              # 월 예산 한도 설정 (없으면 예산 경고 기능 자체가 생략됨)
-├─ prices.json              # (실험적, 미연결) 모델별 토큰 단가표
+├─ prices.json              # 모델별 토큰 단가표 (간소화판, KST 정밀 비용 계산용)
 ├─ requirements.txt
 ├─ PLAN.md                  # 세션별 개발 계획 + 2단계 백로그
 └─ README.md                # 이 문서
@@ -138,22 +144,28 @@ DB 없이 그날그날 Anthropic/OpenAI 비용 API에 해당 기간을 다시 �
 필요 없습니다(`src/weekly_monthly.py`가 날짜 범위 계산, `src/providers/*.py`의
 `get_cost_for_range()`가 조회).
 
-## KST 정밀 비용 계산 (진행 중, 아직 실제 리포트에 연결 안 됨)
+## KST 정밀 비용 계산 (실험적)
 
-지금 리포트의 "어제/이번 달" 숫자는 **UTC 자정 기준**입니다. Anthropic Cost API·OpenAI Costs API
-둘 다 하루(1d) 단위 버킷만 지원하고 그 하루가 UTC 자정에 고정돼 있어서, Cost API만으로는 KST
-자정에 정확히 맞출 방법이 없습니다(2단계 세션 2 조사 결과, `PLAN.md` 참고).
+리포트의 "어제 API 비용 (UTC 기준)" 섹션은 이름 그대로 **UTC 자정 기준**입니다. Anthropic Cost
+API·OpenAI Costs API 둘 다 하루(1d) 단위 버킷만 지원하고 그 하루가 UTC 자정에 고정돼 있어서, 이
+API들만으로는 KST 자정에 정확히 맞출 방법이 없습니다(2단계 세션 2 조사 결과, `PLAN.md` 참고).
 
-대안으로 시간(1h) 단위를 지원하는 **Usage API**(토큰 개수)를 받아와 직접 관리하는 단가표
-(`prices.json`)로 USD를 계산하는 방식을 준비 중입니다. 다만 실제 단가 체계가 캐시 요율·컨텍스트
-길이·배치 할인 등으로 복잡해서, 우선 **input/output/캐시 읽기 + 5분 캐시 쓰기만 반영한 간소화판**
-(`src/pricing.py`, `prices.json`)으로 범위를 좁혔습니다. `prices.json`의 가격은 수동으로 유지해야
-하며, 특히 Claude Sonnet 5는 2026-09-01에 프로모션 요율이 끝나므로 그 이후엔 직접 갱신이 필요합니다.
+대신 시간(1h) 단위를 지원하는 **Usage API**(토큰 개수)를 받아와 직접 관리하는 단가표
+(`prices.json`)로 USD를 계산하는 방식으로 "🧪 KST 정밀 어제 비용 (실험적)" 섹션을 만들었습니다.
+매일 리포트에서 기존 "어제 API 비용 (UTC 기준)" 섹션 **바로 아래에 나란히** 뜹니다(대체 아님).
 
-`src/pricing.py`(가격 계산)와 `src/kst_bucket.py`(KST 날짜 ↔ UTC 시간 변환)는 합성 데이터로
-정확성이 검증됐지만, 아직 실제 Anthropic/OpenAI Usage API를 호출하는 코드가 없고 `report.py`에도
-연결되지 않았습니다 — 기존 발송 경로에는 영향이 없습니다. 다음 세션에서 실제 API 연동 후, 리포트에
-"KST 정밀 어제 비용(실험적)"으로 기존 UTC 섹션과 나란히 추가할 예정입니다.
+다만 실제 단가 체계가 캐시 요율·컨텍스트 길이·배치 할인 등으로 복잡해서, **input/output/캐시 읽기
++ 5분 캐시 쓰기만 반영한 간소화판**(`src/pricing.py`, `prices.json`)으로 범위를 좁혔습니다. 1시간
+캐시 쓰기·배치(batch) 처리·20만 토큰 초과 컨텍스트·오디오 토큰·웹 검색 도구 사용처럼 이 단가표가
+못 다루는 사용량을 만나면 그 부분은 계산에서 빼고(또는 근사치로 처리하고) ⚠️ 경고 문구를 리포트에
+같이 표시합니다 — 그래서 이 섹션의 숫자는 실제 청구액보다 살짝 낮거나(Anthropic 쪽 갭) 높게
+(OpenAI batch 감지 시) 나올 수 있습니다. `prices.json`의 가격은 수동으로 유지해야 하며, 특히 Claude
+Sonnet 5는 2026-09-01에 프로모션 요율이 끝나므로 그 이후엔 직접 갱신이 필요합니다.
+
+**아직 "실험적"으로 표시해둔 이유**: 새 계산 방식이 며칠 더 콘솔(platform.claude.com,
+platform.openai.com)의 실제 청구 금액과 비교되며 검증되기 전까지는, 기존 "어제 API 비용 (UTC
+기준)" 섹션을 신뢰할 수 있는 기준으로 그대로 둡니다. 두 섹션이 충분히 신뢰할 만하다고 판단되면
+그때 UTC 섹션을 KST 정밀 섹션으로 교체할지 별도로 결정할 예정입니다.
 
 ## 알려진 이슈 / 주의사항
 
@@ -175,7 +187,9 @@ DB 없이 그날그날 Anthropic/OpenAI 비용 API에 해당 기간을 다시 �
 ## 에러 처리 방식
 
 - Anthropic/OpenAI 중 한쪽 조회가 실패해도 나머지는 정상 표시되고, "부분 합계"로 표시됩니다.
-  (일간/주간/월간 섹션 모두 동일)
+  (일간/주간/월간/KST 정밀 섹션 모두 동일)
+- "🧪 KST 정밀 어제 비용 (실험적)" 섹션은 Anthropic·OpenAI 둘 다 조회에 실패하면 섹션 자체가
+  조용히 생략됩니다(실험 기능 하나 때문에 핵심 리포트에 에러를 노출하지 않기 위함).
 - `subscriptions.json`이 없거나 형식이 깨져도 비용 섹션은 정상 발송됩니다.
 - `budget.json`이 없으면 예산 경고 섹션만 조용히 생략되고, 형식이 깨지면 경고 문구로 표시됩니다
   (리포트 전체는 죽지 않음).
