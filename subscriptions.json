@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Claude MAX",
+    "amount": 100,
+    "currency": "USD",
+    "billing_day": 18,
+    "memo": ""
+  },
+  {
+    "name": "ChatGPT Plus",
+    "amount": 20,
+    "currency": "USD",
+    "billing_day": 27,
+    "memo": ""
+  }
+]
