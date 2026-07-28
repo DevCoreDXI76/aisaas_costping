@@ -1,13 +1,13 @@
 """
-CostPing 진입점 (세션 1 최소 버전).
+CostPing 진입점 (세션 2 버전: 구독 알림 + Anthropic 비용).
 
-지금은 구독 결제 알림만 담는다. API 비용 수집(Anthropic/OpenAI)은
-세션 2~3에서 이 파일에 추가될 예정.
+OpenAI 비용 수집은 세션 3에서 이 파일에 추가될 예정.
 
 로컬 테스트:
   1) 프로젝트 루트에 .env 파일을 만들고 아래처럼 채운다 (커밋 금지, .gitignore에 포함됨)
        TELEGRAM_BOT_TOKEN=...
        TELEGRAM_CHAT_ID=...
+       ANTHROPIC_ADMIN_KEY=...
   2) python src/report.py 실행
 
 GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로 동작한다.
@@ -20,11 +20,12 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# src/ 를 sys.path에 추가해 telegram, subscriptions 모듈을 바로 import
+# src/ 를 sys.path에 추가해 telegram, subscriptions, providers.* 모듈을 바로 import
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import telegram  # noqa: E402
 import subscriptions as subs_mod  # noqa: E402
+from providers import anthropic_cost  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -64,17 +65,40 @@ def build_subscription_section(due_today: list[dict], due_tomorrow: list[dict]) 
     return "\n".join(lines)
 
 
+def build_cost_section() -> str:
+    """
+    Anthropic 비용 섹션. API 호출이 실패해도 전체 리포트가 죽지 않도록
+    여기서 예외를 잡고 실패 문구를 대신 넣는다 (OpenAI는 세션 3에서 합류 예정).
+    """
+    try:
+        yesterday_usd, month_to_date_usd = anthropic_cost.get_yesterday_and_month_to_date_cost()
+    except anthropic_cost.AnthropicConfigError as e:
+        return f"⚠️ API 비용 조회 건너뜀: {e}"
+    except Exception as e:
+        return f"⚠️ Anthropic 비용 조회 실패: {e}"
+
+    lines = [
+        "어제 API 비용 (UTC 기준)",
+        f"· Anthropic  {format_currency(yesterday_usd, 'USD')}",
+        "",
+        f"이번 달 누적: {format_currency(month_to_date_usd, 'USD')} (Anthropic만)",
+    ]
+    return "\n".join(lines)
+
+
 def build_report() -> str:
     now = datetime.now(KST)
     weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][now.weekday()]
     header = f"📊 CostPing — {now.month}/{now.day}({weekday_kr})"
 
+    cost_section = build_cost_section()
+
     subs = subs_mod.load_subscriptions()
     due_today, due_tomorrow = subs_mod.get_due_today_and_tomorrow(subs)
     subscription_section = build_subscription_section(due_today, due_tomorrow)
 
-    # 세션 2~3에서 여기 "어제 API 비용 / 이번 달 누적" 섹션이 추가될 예정
-    return f"{header}\n\n{subscription_section}"
+    # 세션 3에서 여기 OpenAI 비용이 cost_section에 합류할 예정
+    return f"{header}\n\n{cost_section}\n\n{subscription_section}"
 
 
 def main() -> None:
