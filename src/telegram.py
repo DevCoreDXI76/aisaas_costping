@@ -4,6 +4,18 @@
 환경변수:
   TELEGRAM_BOT_TOKEN - @BotFather에서 발급받은 봇 토큰
   TELEGRAM_CHAT_ID   - getUpdates로 확인한 chat_id
+
+[2단계 세션 2] D-3 결제 알림에 원탭 버튼(인라인 키보드)을 붙이고, 다음날 크론에서
+버튼 응답(callback_query)을 읽어오는 기능을 추가했다. 별도 서버 없이(웹훅 없이)
+매일 08:00 cron에서 getUpdates를 폴링하는 방식이라 응답 반영에 최대 24시간
+지연이 있을 수 있다 — "no server" 아키텍처를 지키기 위한 의도적인 트레이드오프.
+
+상태 저장이 필요 없는 이유: 텔레그램 서버가 각 업데이트를 "확인(offset으로 ack)"
+되기 전까지 계속 들고 있어준다. 그래서 매번 offset 없이(=0) getUpdates를 부르면
+"아직 확인 안 된" 업데이트가 전부 돌아오고, 처리 후 offset=max_update_id+1로
+한 번 더 불러주면 그 시점까지의 업데이트는 텔레그램 쪽에서 확인 처리되어 다음
+번엔 다시 안 돌아온다. 그래서 우리 쪽에 마지막 offset을 파일/DB로 저장해둘
+필요가 없다 (repo에 상태 파일을 두지 않는다는 프로젝트 원칙과도 맞음).
 """
 
 import os
@@ -62,6 +74,64 @@ def send_message(text: str, parse_mode: str | None = None) -> dict:
             f"텔레그램 발송 실패 (HTTP {resp.status_code}): {resp.text[:300]}"
         )
     return resp.json()
+
+
+def send_message_with_keyboard(text: str, keyboard: list[list[dict]]) -> dict:
+    """
+    [2단계 세션 2] 인라인 키보드(버튼)가 달린 메시지를 발송한다.
+
+    Args:
+        text: 발송할 메시지 본문
+        keyboard: 버튼 행(row)의 리스트. 각 행은 다시 버튼 dict의 리스트이며,
+            버튼 dict는 {"text": "표시 문구", "callback_data": "내부 식별 문자열"}
+            형태여야 한다 (텔레그램 InlineKeyboardButton 규격).
+            예) [[{"text": "✅ Netflix 씀", "callback_data": "lu|<page_id>|y"},
+                 {"text": "❌ Netflix 안씀", "callback_data": "lu|<page_id>|n"}]]
+
+    Returns/Raises: send_message와 동일.
+    """
+    token, chat_id = _get_config()
+    url = f"{TELEGRAM_API_BASE}/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {"inline_keyboard": keyboard},
+    }
+    resp = requests.post(url, json=payload, timeout=10)
+    if not resp.ok:
+        raise RuntimeError(
+            f"텔레그램 발송 실패 (HTTP {resp.status_code}): {resp.text[:300]}"
+        )
+    return resp.json()
+
+
+def get_updates(offset: int | None = None) -> list[dict]:
+    """
+    [2단계 세션 2] 아직 확인(ack)되지 않은 업데이트를 전부 가져온다.
+    offset을 안 주면(None) 확인 안 된 것 전부, offset=N을 주면 update_id가
+    N 미만인 것들을 확인 처리하면서 N 이상인 것들을 반환한다 (텔레그램 표준 동작).
+
+    timeout=0(롱폴링 없이 즉시 응답)으로 고정 — 크론 잡은 매일 한 번 짧게 돌고
+    끝나야 하므로 응답을 기다리며 대기할 이유가 없다.
+    """
+    token, _ = _get_config()
+    url = f"{TELEGRAM_API_BASE}/bot{token}/getUpdates"
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    resp = requests.get(url, params=params, timeout=15)
+    if not resp.ok:
+        raise RuntimeError(
+            f"텔레그램 getUpdates 실패 (HTTP {resp.status_code}): {resp.text[:300]}"
+        )
+    return resp.json().get("result", [])
+
+
+def confirm_updates(last_update_id: int) -> None:
+    """[2단계 세션 2] update_id가 last_update_id 이하인 업데이트를 전부 확인(ack)
+    처리한다 — 별도 offset 저장소 없이도 다음 실행에서 같은 업데이트가 다시
+    돌아오지 않게 하기 위함 (get_updates 상단 설명 참고)."""
+    get_updates(offset=last_update_id + 1)
 
 
 if __name__ == "__main__":

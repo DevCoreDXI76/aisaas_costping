@@ -17,9 +17,19 @@ GitHub Actions (cron, 매일 23:00 UTC = 08:00 KST)
        ├─ src/budget.py + budget.json      → 월 예산 초과 경고
        ├─ src/weekly_monthly.py            → 매주 월요일 "지난주 요약",
        │                                      매월 1일 "지난달 요약" 추가
-       ├─ subscriptions.json               → 오늘·내일 결제 예정 구독
-       └─ src/telegram.py                  → 리포트 발송 (실패 시에도 에러 알림 발송)
+       ├─ src/providers/notion_subscriptions.py + notion_config.json
+       │                                     → Notion "구독 중" DB에서 오늘·내일·D-3 결제 예정 구독 조회
+       │                                        + "마지막 이용일" 필드 기록(get_due_in_days/update_last_used_date)
+       │                                        + 3개월 이상 미이용 추정(get_unused_subscriptions, 매월 1일)
+       ├─ src/reply_processor.py           → 텔레그램 인라인 버튼(✅/❌) 응답 회수 → Notion 반영
+       └─ src/telegram.py                  → 리포트 발송(+인라인 버튼) + getUpdates 폴링 + 에러 알림
 ```
+
+**D-3 알림 + 원탭 버튼 흐름**: 결제 3일 전인 구독은 리포트 메시지 하단에 "✅ 이번 달 씀 / ❌ 안 씀"
+버튼이 함께 붙습니다. 버튼을 누르면 텔레그램이 그 응답(`callback_query`)을 서버에 보관해두고,
+**다음 크론 실행(보통 다음날 08:00) 때** `src/reply_processor.py`가 그걸 읽어와 Notion "마지막
+이용일" 필드에 반영합니다. 실시간 웹훅 서버를 두지 않는 대신 응답 반영에 최대 24시간 정도 지연이
+생길 수 있습니다 — "서버 없음" 아키텍처를 지키기 위해 의도적으로 선택한 트레이드오프입니다.
 
 ## 프로젝트 구조
 
@@ -30,16 +40,17 @@ aisaas_costping/
 │  ├─ report.py             # 진입점: 수집 → 포맷 → 발송
 │  ├─ providers/
 │  │  ├─ anthropic_cost.py
-│  │  └─ openai_cost.py
-│  ├─ subscriptions.py      # 결제일 계산 (오늘/내일, 말일 처리)
+│  │  ├─ openai_cost.py
+│  │  └─ notion_subscriptions.py  # Notion "구독 중" DB 조회/기록 (결제일 계산 + 마지막 이용일)
 │  ├─ budget.py             # 월 예산 초과 경고
 │  ├─ weekly_monthly.py     # 주간/월간 요약 날짜 범위 계산
+│  ├─ reply_processor.py    # D-3 알림 버튼 응답 회수 → Notion 반영
 │  ├─ pricing.py            # KST 정밀 비용 계산기(간소화판 단가표 기반) — 아래 참고
 │  ├─ kst_bucket.py         # KST 캘린더 날짜 ↔ UTC 시간 변환
-│  └─ telegram.py           # 발송 + 에러 알림
+│  └─ telegram.py           # 발송(+인라인 버튼) + getUpdates 폴링 + 에러 알림
 ├─ scripts/
 │  └─ explore_anthropic_usage.py  # Usage API 응답 확인용 1회성 탐색 스크립트(파이프라인 아님)
-├─ subscriptions.json
+├─ notion_config.json       # Notion 구독 DB의 database_id 등 (비밀 아님, 커밋됨)
 ├─ budget.json              # 월 예산 한도 설정 (없으면 예산 경고 기능 자체가 생략됨)
 ├─ prices.json              # 모델별 토큰 단가표 (간소화판, KST 정밀 비용 계산용)
 ├─ requirements.txt
@@ -59,8 +70,13 @@ aisaas_costping/
    - 키 접두사는 `sk-ant-admin01-...` 입니다.
 3. **OpenAI Admin Key 발급**: [platform.openai.com](https://platform.openai.com) → Settings →
    Organization → API keys → Admin keys → Create new secret key. (조직 **Owner** 권한 필요)
-4. **GitHub Secrets 등록**: repo → Settings → Secrets and variables → Actions → New repository secret
-   으로 아래 4개 등록.
+4. **Notion Integration 발급 + 연결**: [notion.so/my-integrations](https://www.notion.so/my-integrations)
+   → **New integration** → 이름 아무거나(예: CostPing) → 워크스페이스 선택 → 생성. **Internal Integration
+   Secret**(`ntn_...` 또는 `secret_...`로 시작)을 복사해둡니다. 그 다음 구독을 관리 중인 Notion
+   데이터베이스(예: "구독 중") 페이지를 열어 우측 상단 `···` → **연결(Connections)** → 방금 만든
+   Integration을 추가해줘야 API로 읽을 수 있습니다(이 단계를 빼먹으면 401 오류가 납니다).
+5. **GitHub Secrets 등록**: repo → Settings → Secrets and variables → Actions → New repository secret
+   으로 아래 5개 등록.
 
    | Name | 설명 |
    |---|---|
@@ -68,10 +84,12 @@ aisaas_costping/
    | `OPENAI_ADMIN_KEY` | OpenAI Admin Key |
    | `TELEGRAM_BOT_TOKEN` | 텔레그램 봇 토큰 |
    | `TELEGRAM_CHAT_ID` | 텔레그램 chat_id |
+   | `NOTION_API_KEY` | Notion Integration Secret (위 4번 단계에서 발급) |
 
-5. **subscriptions.json 작성**: 아래 "구독 추가/수정 방법" 참고.
-6. **budget.json 확인/수정**: 아래 "예산 경고 설정 방법" 참고. (선택 사항 — 안 써도 나머지 기능은 그대로 동작)
-7. 커밋/푸시하면 GitHub Actions가 매일 KST 08:00에 자동 실행됩니다. Actions 탭 →
+6. **notion_config.json 확인**: 데이터베이스가 다르면 `database_id`를 바꿔야 합니다. 아래
+   "구독 관리 방법(Notion)" 참고.
+7. **budget.json 확인/수정**: 아래 "예산 경고 설정 방법" 참고. (선택 사항 — 안 써도 나머지 기능은 그대로 동작)
+8. 커밋/푸시하면 GitHub Actions가 매일 KST 08:00에 자동 실행됩니다. Actions 탭 →
    "Daily Cost Report" → **Run workflow** 로 언제든 수동 테스트 가능합니다.
 
 ## 로컬에서 테스트하기
@@ -87,36 +105,90 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ANTHROPIC_ADMIN_KEY=...
 OPENAI_ADMIN_KEY=...
+NOTION_API_KEY=...
 ```
 
 ```powershell
 python src/report.py
 ```
 
-## 구독 추가/수정 방법
+Notion 연동만 따로 확인하고 싶으면:
 
-`subscriptions.json`에 아래 형식으로 항목을 추가/수정하면 됩니다.
-
-```json
-[
-  {
-    "name": "구독명",
-    "amount": 20,
-    "currency": "USD",
-    "billing_day": 15,
-    "memo": ""
-  }
-]
+```powershell
+python src/providers/notion_subscriptions.py
 ```
 
-- `billing_day`가 해당 월의 마지막 날보다 크면(예: 31일인데 4월/6월/9월/11월, 또는 2월) 그 달의
-  마지막 날에 결제되는 것으로 자동 처리됩니다 (`src/subscriptions.py`의 말일 보정 로직).
-- 수정 후 커밋/푸시하면 다음 실행부터 반영됩니다.
+## 구독 관리 방법 (Notion)
+
+구독 결제 알림의 소스는 **Notion**입니다(과거 `subscriptions.json` 수동 관리는 폐기됨 — 실제
+결제 중인 구독과 자꾸 어긋나는 문제가 있었습니다). Notion에서 구독을 추가/해지/금액 변경하면
+다음 리포트부터 그대로 반영됩니다. 별도로 커밋/푸시할 필요가 없습니다.
+
+> ⚠️ **중요**: 원래 쓰시던 구독 관리 DB가 Notion이 "데이터소스" 개념을 도입하기 전에 만들어진
+> 것이라, 새로 만든 Integration이 그 DB의 데이터를 API로 읽을 수 없는 특이 케이스를 만났습니다
+> (자세한 트러블슈팅 과정은 `PLAN.md`의 2단계 세션 3-1 로그 참고). 그래서 CostPing 전용으로
+> 완전히 새로운 Notion 데이터베이스를 만들어 그리로 데이터를 옮겼습니다. **구독 추가/해지/금액
+> 변경은 이제 이 전용 DB에서 해야 리포트에 반영됩니다** — 기존 DB를 계속 쓰던 습관이 있다면
+> 헷갈리지 않게 주의하세요. `notion_config.json`의 `database_id`가 이 전용 DB를 가리킵니다.
+
+이 Notion 데이터베이스에서 다음 필드를 사용합니다.
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| 이름 | title | 구독명 |
+| 상태 | select | `구독 중`이어야 알림 대상에 포함됨 (`구독 해지`는 제외) |
+| 결제 시작일 | date | 최초 결제(또는 갱신 기준)일 |
+| 결제 주기 | select | `월` 또는 `연` |
+| 결제 금액(KRW) / 결제 금액(USD) | number | 둘 중 하나만 채우면 됨 (USD가 있으면 USD 우선) |
+| 비고 | text | 선택 사항 |
+| 마지막 이용일 | date | **사람이 직접 채우지 않아도 됨.** D-3 알림의 "✅ 이번 달 씀" 버튼을 누르면 코드가 자동으로 오늘 날짜를 채웁니다. |
+
+- 다음 결제일은 Notion의 수식 필드를 그대로 읽는 게 아니라, `결제 시작일` + `결제 주기`로
+  `src/providers/notion_subscriptions.py`가 직접 계산합니다(말일 보정 포함, 예: 1/31 매달 결제 →
+  2월엔 2/28). 실사용 데이터로 Notion 화면의 "다음 결제일" 수식 값과 전부 일치함을 확인했습니다.
+- 다른 Notion 데이터베이스를 쓰거나 필드명을 바꿨다면 `notion_config.json`의 `database_id`와
+  `active_status_value`를 맞게 수정하세요(Notion에서 해당 데이터베이스를 열고 URL에 있는
+  32자리 ID 부분). 필드명 자체(이름/상태/결제 시작일 등)가 다르면
+  `src/providers/notion_subscriptions.py`의 `_parse_subscription_page()` 안의 키 문자열을 함께
+  바꿔야 합니다.
+- Notion 조회가 실패하면(Integration 연결 안 함, `NOTION_API_KEY` 미설정 등) 이 섹션만 조용히
+  건너뛰고 나머지 리포트는 정상 발송됩니다.
+
+## 구독 이용 확인 (D-3 알림 + 원탭 버튼)
+
+"좀비 구독"(안 쓰는데 계속 결제되는 구독) 방지를 위해, 결제 3일 전인 구독은 리포트 메시지에
+"✅ {구독명} 씀" / "❌ {구독명} 안 씀" 버튼이 함께 붙습니다.
+
+- **✅ 씀**을 누르면 → 다음 크론 실행 때 Notion "마지막 이용일"이 그날 날짜로 갱신됩니다.
+- **❌ 안 씀**을 누르면 → Notion은 갱신되지 않습니다(마지막 이용일이 그대로 남아 "몇 개월째 안
+  씀"을 나중에 판단할 수 있는 근거가 됩니다).
+- 버튼을 안 누르면 아무 일도 일어나지 않습니다(다음 D-3 알림 때 다시 물어봅니다).
+- 응답은 **실시간이 아니라 다음 크론 실행 때** 반영됩니다(최대 24시간 정도 지연 가능) — 별도
+  웹훅 서버 없이 매일 08:00 폴링만으로 처리하기 위한 의도적인 설계입니다. 리포트 상단에 "📋 지난
+  답변 처리" 섹션으로 처리 결과가 표시됩니다(처리할 응답이 없으면 이 섹션 자체가 생략됩니다).
+- 로컬에서 직접 확인하려면: `python src/report.py`로 알림을 받고 버튼을 누른 뒤, 다시
+  `python src/report.py`를 한 번 더 실행하면 "📋 지난 답변 처리" 섹션에 결과가 뜹니다.
+
+### 3개월 이상 미이용 구독 하이라이트
+
+매월 1일 "🗓️ 지난달 요약" 바로 다음에 "🧟 3개월 이상 미이용 추정 구독" 섹션이 추가로
+표시됩니다. D-3 알림에 응답을 안 하고 그냥 넘어가면 놓치기 쉬운 좀비 구독을, 한 달에 한 번
+눈에 띄게 모아 보여주는 게 목적입니다.
+
+- 판단 기준: `마지막 이용일`이 있으면 그 날짜로부터, 없으면 `결제 시작일`로부터 3개월 이상
+  지났는지로 판단합니다. 구독을 시작한 지 3개월이 안 됐으면(아직 D-3 알림을 못 받았을 수
+  있으므로) "판단할 데이터 없음"으로 보고 제외됩니다.
+- 대상 구독이 없으면 이 섹션 자체가 생략됩니다.
+- 임계값(현재 3개월 고정)을 바꾸고 싶으면 `src/report.py`의
+  `_build_unused_subscription_highlight_safe()`에서 호출하는
+  `notion_subscriptions.get_unused_subscriptions(3)`의 인자를 수정하세요.
+- 이 필드(`마지막 이용일`)는 2026-07-28에 막 추가돼서, 기존 구독은 D-3 알림에 한 번 이상
+  응답이 쌓이기 전까지는 "결제 시작일" 기준으로만 판단됩니다.
 
 ## 예산 경고 설정 방법
 
-`budget.json`에서 하루/이번 달 API 비용(Anthropic+OpenAI **종량제 사용 비용 합계만**,
-`subscriptions.json`의 정액 구독료는 포함 안 됨) 한도를 각각 설정합니다.
+`budget.json`에서 하루/이번 달 API 비용(Anthropic+OpenAI **종량제 사용 비용 합계만**, Notion에
+등록된 정액 구독료는 포함 안 됨) 한도를 각각 설정합니다.
 
 ```json
 {
@@ -190,7 +262,14 @@ platform.openai.com)의 실제 청구 금액과 비교되며 검증되기 전까
   (일간/주간/월간/KST 정밀 섹션 모두 동일)
 - "🧪 KST 정밀 어제 비용 (실험적)" 섹션은 Anthropic·OpenAI 둘 다 조회에 실패하면 섹션 자체가
   조용히 생략됩니다(실험 기능 하나 때문에 핵심 리포트에 에러를 노출하지 않기 위함).
-- `subscriptions.json`이 없거나 형식이 깨져도 비용 섹션은 정상 발송됩니다.
+- Notion 구독 조회가 실패해도(설정 미완료, 네트워크 오류, 필드명 불일치 등) 비용 섹션은 정상
+  발송되고 구독 섹션에만 경고 문구가 표시됩니다.
+- "🧟 3개월 이상 미이용 추정 구독" 섹션도 동일한 방어 패턴입니다 — Notion 미설정이면
+  조용히 생략되고(이미 구독 섹션에 경고가 뜨므로 중복 표시 안 함), 그 외 예상 못 한 에러만
+  경고 문구로 표시됩니다.
+- D-3 알림/버튼 응답 처리(`reply_processor.py`)가 실패해도 리포트의 나머지 섹션은 정상
+  발송됩니다 — 텔레그램 조회 실패, Notion 반영 실패 모두 경고 문구로만 표시되고 예외가 전체
+  리포트 발송을 막지 않습니다.
 - `budget.json`이 없으면 예산 경고 섹션만 조용히 생략되고, 형식이 깨지면 경고 문구로 표시됩니다
   (리포트 전체는 죽지 않음).
 - 그 외 예상 못 한 에러가 나면 전체 리포트 대신 에러 요약을 텔레그램으로 발송합니다(가능한 경우).

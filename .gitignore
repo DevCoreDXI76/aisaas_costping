@@ -1,3 +1,4 @@
 .env
 __pycache__/
 *.pyc
+scripts/usage_sample_response.json

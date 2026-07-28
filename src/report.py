@@ -1,6 +1,6 @@
 """
-CostPing 진입점 (2단계 세션 2C 버전: MVP + 월 예산 초과 경고 + 주간/월간 요약
-+ KST 정밀 어제 비용(실험적)).
+CostPing 진입점 (2단계 세션 3 버전: MVP + 월 예산 초과 경고 + 주간/월간 요약
++ KST 정밀 어제 비용(실험적) + Notion 구독 연동).
 
 로컬 테스트:
   1) 프로젝트 루트에 .env 파일을 만들고 아래처럼 채운다 (커밋 금지, .gitignore에 포함됨)
@@ -8,6 +8,7 @@ CostPing 진입점 (2단계 세션 2C 버전: MVP + 월 예산 초과 경고 + �
        TELEGRAM_CHAT_ID=...
        ANTHROPIC_ADMIN_KEY=...
        OPENAI_ADMIN_KEY=...
+       NOTION_API_KEY=...
   2) python src/report.py 실행
 
 GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로 동작한다.
@@ -22,6 +23,24 @@ GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로
     그 경우 경고 문구가 같이 표시된다(src/providers/{anthropic_cost,openai_cost}.py의
     get_kst_precise_cost_for_day). 두 제공사 다 조회에 실패하면 이 섹션 자체가
     조용히 생략된다 — 실험 기능 하나 때문에 핵심 리포트에 에러를 노출하지 않기 위함.
+  - 구독 결제 알림의 소스를 Notion "구독 중" 데이터소스로 전환 (2단계 세션 3):
+    기존 subscriptions.json 수동 관리를 대체한다. 실제 결제 중인 구독(OTT 포함)과
+    상시 어긋나는 문제를 해결하기 위함 — src/providers/notion_subscriptions.py,
+    notion_config.json 참고. NOTION_API_KEY 미설정 시 이 섹션만 건너뛰고 나머지는
+    정상 발송된다(다른 섹션들과 동일한 방어 패턴).
+  - "좀비 구독"(안 쓰는데 계속 결제되는 구독) 방지를 위한 D-3 알림 + 원탭 버튼
+    + Notion 기록 자동화 (2단계 세션 3 세션 2): 결제 3일 전에 "이번 달 쓰셨나요?"
+    를 인라인 버튼(✅/❌)과 함께 물어보고, 사용자가 버튼을 누르면 다음 크론 실행
+    때 그 응답을 읽어와 Notion "마지막 이용일" 필드에 반영한다(src/reply_processor.py,
+    src/telegram.py의 send_message_with_keyboard/get_updates/confirm_updates,
+    src/providers/notion_subscriptions.py의 get_due_in_days/update_last_used_date).
+    웹훅 서버 없이 매일 08:00 폴링만으로 처리하기 때문에 응답 반영까지 최대 24시간
+    지연될 수 있다 — "서버 없음" 아키텍처를 지키기 위해 의도적으로 감수한 트레이드오프.
+  - 매월 1일 "지난달 요약" 아래에 "🧟 3개월 이상 미이용 추정 구독" 하이라이트 추가
+    (2단계 세션 3(선택)): "마지막 이용일"(또는 그마저 없으면 결제 시작일)로부터 3개월
+    이상 지난 활성 구독을 모아 보여준다. D-3 알림에 응답을 안 하고 넘어가면 놓치기
+    쉬운 좀비 구독을 한 달에 한 번 눈에 띄게 정리해서 보여주는 게 목적
+    (src/providers/notion_subscriptions.py의 get_unused_subscriptions).
 """
 
 import os
@@ -31,14 +50,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# src/ 를 sys.path에 추가해 telegram, subscriptions, providers.* 모듈을 바로 import
+# src/ 를 sys.path에 추가해 telegram, budget, providers.* 모듈을 바로 import
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import telegram  # noqa: E402
-import subscriptions as subs_mod  # noqa: E402
 import budget  # noqa: E402
 import weekly_monthly  # noqa: E402
-from providers import anthropic_cost, openai_cost  # noqa: E402
+import reply_processor  # noqa: E402
+from providers import anthropic_cost, openai_cost, notion_subscriptions  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -144,16 +163,67 @@ def build_cost_section() -> tuple[str, float | None, float | None]:
 
 
 def _build_subscription_section_safe() -> str:
-    """subscriptions.json이 없거나 형식이 깨져 있어도 비용 섹션은 정상 발송되도록
-    여기서 예외를 흡수한다 (build_cost_section과 동일한 방어 패턴)."""
+    """
+    [2단계 세션 3] Notion "구독 중" 데이터소스가 결제 알림의 단일 소스다
+    (기존 subscriptions.json 수동 관리는 폐기 — src/providers/notion_subscriptions.py 참고).
+    조회 실패해도(Notion 설정 미완료 포함) 나머지 리포트는 정상 발송되도록 여기서
+    예외를 흡수한다 (build_cost_section과 동일한 방어 패턴)."""
     try:
-        subs = subs_mod.load_subscriptions()
-        due_today, due_tomorrow = subs_mod.get_due_today_and_tomorrow(subs)
+        due_today, due_tomorrow = notion_subscriptions.get_due_today_and_tomorrow()
         return build_subscription_section(due_today, due_tomorrow)
-    except FileNotFoundError:
-        return "⚠️ 구독 정보 조회 건너뜀: subscriptions.json 파일이 없습니다."
+    except notion_subscriptions.NotionConfigError as e:
+        return f"⚠️ 구독 정보 조회 건너뜀: {e}"
     except Exception as e:
         return f"⚠️ 구독 정보 조회 실패: {e}"
+
+
+def _build_reply_processing_section_safe() -> str | None:
+    """[2단계 세션 2] 지난 D-3 알림에 달린 텔레그램 버튼 응답을 처리하고 결과를
+    요약하는 섹션. 처리할 응답이 없으면 None(섹션 생략) — 매일 뜨는 리포트에
+    "처리할 응답 없음"까지 매번 표시하면 노이즈만 늘어나기 때문."""
+    try:
+        results = reply_processor.process_pending_replies()
+    except Exception as e:
+        return f"⚠️ 지난 응답 처리 중 오류: {e}"
+    if not results:
+        return None
+    return "\n".join(["📋 지난 답변 처리"] + [f"· {r}" for r in results])
+
+
+def _build_d3_alert_section_and_keyboard() -> tuple[str | None, list]:
+    """
+    [2단계 세션 2] 결제 3일 전인 구독에 "이번 달 쓰셨나요?" 인라인 버튼을 붙인다.
+    D-day가 아니라 D-3에 물어보는 이유: 해지하고 싶다면 실제 결제가 일어나기 전에
+    판단할 시간이 있어야 의미가 있어서다.
+
+    Returns:
+        (섹션 텍스트 또는 None, 인라인 키보드 행 리스트) — 대상 구독이 없으면
+        (None, []). Notion 조회 실패 시에도 리포트 전체는 죽지 않도록 여기서
+        예외를 흡수한다(다른 _..._safe 함수들과 동일한 방어 패턴).
+    """
+    try:
+        due_in_3 = notion_subscriptions.get_due_in_days(3)
+    except notion_subscriptions.NotionConfigError:
+        return None, []  # Notion 미설정 — 이미 다른 섹션에서 경고가 뜨므로 중복 표시 안 함
+    except Exception as e:
+        return f"⚠️ D-3 알림 대상 조회 실패: {e}", []
+
+    if not due_in_3:
+        return None, []
+
+    lines = ["⏰ 3일 후 결제 예정 — 이번 달 쓰셨나요?"]
+    keyboard: list[list[dict]] = []
+    for s in due_in_3:
+        amt = format_currency(s["amount"], s["currency"])
+        lines.append(f"· {s['name']} {amt}")
+        keyboard.append(
+            [
+                {"text": f"✅ {s['name']} 씀", "callback_data": f"lu|{s['page_id']}|y"},
+                {"text": f"❌ {s['name']} 안 씀", "callback_data": f"lu|{s['page_id']}|n"},
+            ]
+        )
+    lines.append("(아래 버튼으로 답해주세요 — 응답은 다음 리포트 때 반영돼요)")
+    return "\n".join(lines), keyboard
 
 
 def _build_range_summary_section(title_emoji: str, title: str, label: str, start, end) -> str:
@@ -205,6 +275,41 @@ def _build_monthly_section_safe(today) -> str | None:
         return _build_range_summary_section("🗓️", "지난달 요약", label, start, end)
     except Exception as e:
         return f"⚠️ 지난달 요약 생성 실패: {e}"
+
+
+def _build_unused_subscription_highlight_safe(today) -> str | None:
+    """
+    [2단계 세션 3(선택)] 매월 1일 "지난달 요약" 바로 아래에 "3개월 이상 미이용 추정"
+    구독을 하이라이트한다. 좀비 구독(안 쓰는데 계속 결제)을 D-3 알림만으로는 놓치기
+    쉬워서(버튼을 안 누르고 넘어가면 그냥 다음 달로 넘어감) 한 달에 한 번 눈에 띄게
+    모아서 보여주는 게 목적 — src/providers/notion_subscriptions.get_unused_subscriptions()
+    참고(판단 기준: 마지막 이용일 또는 결제 시작일로부터 3개월 경과).
+
+    다른 섹션들과 동일한 방어 패턴: Notion 미설정이면 조용히 생략(이미 구독 섹션에서
+    경고가 뜨므로 중복 표시 안 함), 대상이 없으면 생략, 예상 못 한 에러만 경고로 표시.
+    """
+    if not weekly_monthly.is_first_of_month(today):
+        return None
+    try:
+        unused = notion_subscriptions.get_unused_subscriptions(3)
+    except notion_subscriptions.NotionConfigError:
+        return None
+    except Exception as e:
+        return f"⚠️ 미이용 구독 하이라이트 생성 실패: {e}"
+
+    if not unused:
+        return None
+
+    lines = ["🧟 3개월 이상 미이용 추정 구독"]
+    for s in unused:
+        amt = format_currency(s["amount"], s["currency"])
+        if s["unused_reason"] == "last_used":
+            detail = f"마지막 이용 {s['reference_date']}"
+        else:
+            detail = f"이용 확인 이력 없음, 구독 시작 {s['reference_date']}"
+        lines.append(f"· {s['name']} {amt} — {s['months_since']}개월째 ({detail})")
+    lines.append("(해지를 고려해보세요 — Notion에서 상태를 '구독 해지'로 바꾸면 다음부터 제외돼요)")
+    return "\n".join(lines)
 
 
 def _fetch_provider_kst_precise_cost(provider_module, config_error_cls, kst_date):
@@ -261,7 +366,14 @@ def _build_kst_precise_section_safe(today) -> str | None:
         return f"⚠️ KST 정밀 비용(실험적) 계산 실패: {e}"
 
 
-def build_report() -> str:
+def build_report() -> tuple[str, list]:
+    """
+    Returns:
+        (리포트 본문 텍스트, 인라인 키보드 행 리스트) 튜플. 키보드가 빈 리스트면
+        일반 텍스트 메시지로, 아니면(D-3 알림 대상이 있으면) 버튼이 달린 메시지로
+        보내야 한다 — main()에서 이 값을 보고 telegram.send_message /
+        send_message_with_keyboard 중 하나를 고른다.
+    """
     now = datetime.now(KST)
     today = now.date()
     weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][now.weekday()]
@@ -270,7 +382,14 @@ def build_report() -> str:
     cost_text, yesterday_total, month_total = build_cost_section()
     subscription_section = _build_subscription_section_safe()
 
-    sections = [header, cost_text]
+    sections = [header]
+
+    # [2단계 세션 2] 지난 D-3 알림 응답 처리 결과 — 있으면 맨 위(헤더 바로 다음)에 표시
+    reply_text = _build_reply_processing_section_safe()
+    if reply_text:
+        sections.append(reply_text)
+
+    sections.append(cost_text)
 
     if yesterday_total is not None or month_total is not None:
         budget_text = budget.build_budget_section_safe(yesterday_total, month_total)
@@ -283,6 +402,10 @@ def build_report() -> str:
 
     sections.append(subscription_section)
 
+    d3_text, keyboard = _build_d3_alert_section_and_keyboard()
+    if d3_text:
+        sections.append(d3_text)
+
     weekly_text = _build_weekly_section_safe(today)
     if weekly_text:
         sections.append(weekly_text)
@@ -291,14 +414,21 @@ def build_report() -> str:
     if monthly_text:
         sections.append(monthly_text)
 
-    return "\n\n".join(sections)
+    unused_text = _build_unused_subscription_highlight_safe(today)
+    if unused_text:
+        sections.append(unused_text)
+
+    return "\n\n".join(sections), keyboard
 
 
 def main() -> None:
     _load_dotenv_if_present()
     try:
-        message = build_report()
-        telegram.send_message(message)
+        message, keyboard = build_report()
+        if keyboard:
+            telegram.send_message_with_keyboard(message, keyboard)
+        else:
+            telegram.send_message(message)
         print("발송 완료:\n" + message)
     except telegram.TelegramConfigError as e:
         print(f"설정 오류: {e}", file=sys.stderr)

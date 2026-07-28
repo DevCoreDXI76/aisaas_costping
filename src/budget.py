@@ -1,15 +1,15 @@
 """
 하루/월 예산 초과 경고.
 
-budget.json 스키마 (프로젝트 루트, subscriptions.json과 동일한 레벨):
+budget.json 스키마 (프로젝트 루트, notion_config.json과 동일한 레벨):
 {
   "daily_budget_usd": 5,          # 어제 하루 API 비용(Anthropic+OpenAI 합계) 한도, USD
   "monthly_budget_usd": 60,       # 이번 달 API 비용(Anthropic+OpenAI 합계) 한도, USD
   "warning_threshold_pct": 80     # 이 %를 넘으면 경고, 100% 넘으면 "초과" 경고로 문구가 바뀜 (하루/월 공통)
 }
 
-주의: 이 예산은 subscriptions.json의 구독 결제액(Claude MAX 등 정액 구독)과는 별개로,
-Anthropic+OpenAI API 종량제 사용 비용에만 적용된다.
+주의: 이 예산은 Notion에 등록된 구독 결제액(OTT/AI 정액 구독 등, src/providers/notion_subscriptions.py)과는
+별개로, Anthropic+OpenAI API 종량제 사용 비용에만 적용된다.
 
 daily_budget_usd / monthly_budget_usd는 각각 독립적으로 켜고 끌 수 있다. 둘 다 0 이하로
 두거나(또는 키 자체를 생략) budget.json 파일 자체를 만들지 않으면 해당 경고는 조용히 생략된다.
