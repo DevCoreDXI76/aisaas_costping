@@ -119,12 +119,12 @@ aisaas_costping/
 ## 6. 2단계 백로그 (지금 하지 않음)
 
 - Next.js + Supabase 웹 대시보드, 구독 CRUD UI
-- KST 정밀 일 경계 (시간 단위 버킷 집계)
 - **Google Gemini API 비용 추가** (2026-07-27 조사): Anthropic/OpenAI처럼 간단한 Admin API 키로 비용 조회 불가. AI Studio 대시보드 전용, 프로그래밍 조회는 GCP Cloud Billing BigQuery Export 구축 필요(별도 GCP 프로젝트 연결 + 서비스 계정 + BigQuery 쿼리) — MVP 아키텍처(서버 없는 GitHub Actions 스크립트)와 무게감이 다름
 - **Voyage AI 비용 추가** (2026-07-27 조사): MongoDB Atlas 산하로 통합됨. 공개 REST 비용/사용량 API 없음, Atlas UI(Usage/Cost Explorer/Invoices)로만 확인 가능. 프로그래밍 연동은 MongoDB에 별도 문의 필요
 - 기타 제공사 추가
 
 > ~~월 예산 초과 경고, 주간/월간 요약 리포트~~ → 2단계 세션 1에서 완료 (아래 7번 참고)
+> KST 정밀 일 경계는 2단계 세션 2로 승격되어 진행 중 (아래 7번, "세션 2" 참고) — 백로그 목록에서 제외.
 
 ## 7. 2단계 진행 로그
 
@@ -146,3 +146,46 @@ aisaas_costping/
       (`build_budget_warnings()`가 0~2줄 경고를 반환), `src/report.py`의 `build_cost_section()`이
       어제 하루 비용도 함께 반환하도록 변경. 실제 사용자 리포트 숫자($5.94/$71.27)로 재현 테스트해
       하루·월 두 경고가 모두 정상 표시됨을 확인.
+
+### 2단계 세션 2 — KST 정밀 일 경계 (진행 중, 세션 A 완료: 2026-07-28)
+
+**조사 결과 (착수 전 필수 확인 사항)**:
+- Anthropic Cost Report API, OpenAI Costs API 둘 다 `bucket_width`가 **하루(1d)만 지원**한다
+  (공식 문서 확인). 그 하루 버킷은 UTC 자정에 고정되는 것으로 보임(Anthropic 공식 쿡북 예제 코드
+  주석: "snap to start of day to align with bucket boundaries") — 즉 `starting_at`을 KST 자정으로
+  바꿔서 넣어도 진짜 KST 기준으로 하루가 안 끊길 가능성이 높다. 그래서 애초에 **Cost API만으로는
+  KST 정밀화가 불가능**하다고 결론.
+- 대안은 **Usage API**(`GET /v1/organizations/usage_report/messages` 등, `bucket_width=1h` 지원,
+  최대 168버킷=7일치)로 토큰 사용량(모델별 input/output/cache 토큰 개수)을 받아와서, 직접 유지하는
+  단가표로 USD를 계산하는 것. 이러면 KST 자정에 정확히 맞는 24시간 구간을 그대로 질의할 수 있다.
+- 다만 실제 단가 체계가 훨씬 복잡함을 확인: 모델별 input/output 단가 외에 5분/1시간 캐시 쓰기 요율,
+  캐시 읽기 요율, 20만 토큰 초과 컨텍스트 요율, 배치(batch) 50% 할인, 데이터 레지던시 +10% 할증이
+  다 따로 있고, 가격 자체도 수시로 바뀜(예: Claude Sonnet 5는 2026-09-01에 프로모션 요율 종료 예정).
+  이걸 다 반영한 완전판 단가표는 유지보수 부담이 커서, **사용자 결정으로 "간소화판"**
+  (input/output/캐시 읽기 + 5분 캐시 쓰기만 반영, 나머지는 감지 시 경고 후 근사치 처리)으로 범위를
+  좁힘. OpenAI/Anthropic 공식 가격 페이지에서 확인한 현재 가격을 `prices.json`에 반영.
+
+**세션 A 완료 (계산 엔진만, 아직 report.py에 연결 안 함 — 안전하게 격리된 상태)**:
+- [x] `prices.json` (신규): 모델 접두사별 USD/100만 토큰 단가표. `_readme`에 반영 범위/한계와
+      공식 가격 페이지 링크 명시.
+- [x] `src/pricing.py` (신규): `calc_anthropic_cost_usd()` / `calc_openai_cost_usd()` — 토큰
+      개수를 받아 USD로 환산하는 순수 계산기. 단가표에 없는 모델을 만나면 예외를 던지지 않고
+      경고 문구를 반환(그 모델분은 0으로 집계에서 제외 + 리포트에 명시할 수 있게).
+- [x] `src/kst_bucket.py` (신규): `kst_day_to_utc_range()` — 주어진 KST 캘린더 날짜에 정확히
+      대응하는 UTC 24시간 구간을 계산(한국은 DST 없어 연중 고정 UTC+9). `kst_range_to_utc_range()`로
+      여러 날짜 범위도 지원(주간/월간용). `group_records_by_kst_date()`로 넓은 구간에 걸친 시간별
+      레코드를 KST 날짜별로 재구성 가능.
+- [x] 합성 데이터로 단위 테스트: 가격 계산 정확성(수기 검산 일치), KST 자정 경계(UTC 15:00) 케이스,
+      연중 DST 없음 확인, KST 날짜 그룹핑 경계 케이스(UTC 14시/15시/23시) 모두 통과.
+- ✅ 완료 기준: 계산 엔진이 report.py와 분리된 상태로 정확성 검증됨. 아직 실제 Anthropic/OpenAI
+      Usage API를 호출하는 코드는 없음 — 실제 API 응답 형태(정확한 모델 ID 문자열, 필드명)를
+      모르는 채로 어댑터를 짜는 게 더 위험하다고 판단해 다음 세션으로 미룸.
+
+**다음 세션 계획**:
+- **세션 B**: Anthropic Usage API(`usage_report/messages`) 실제 연동. 실제 응답을 보고
+  (1) 모델 ID 문자열이 `prices.json`의 접두사와 맞는지 확인/수정, (2) `service_tier`/`context_window`
+  같은 필드로 배치·20만 토큰 초과 사용량을 감지해 경고 로직 완성. 이때까진 이 기능을 report.py에
+  연결하지 않고 별도로 실행/검증만 한다(기존 리포트 발송 경로는 안 건드림).
+- **세션 C**: OpenAI Usage API 연동 + `report.py`에 "KST 정밀 어제 비용(실험적)"로 **기존 UTC 섹션과
+  나란히 추가**(교체 아님). 며칠 지켜보며 콘솔의 실제 청구 금액과 비교해 신뢰할 수 있다고 판단되면
+  그때 기존 UTC 기준 섹션을 대체할지 결정.

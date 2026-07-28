@@ -30,9 +30,12 @@ aisaas_costping/
 │  ├─ subscriptions.py      # 결제일 계산 (오늘/내일, 말일 처리)
 │  ├─ budget.py             # 월 예산 초과 경고
 │  ├─ weekly_monthly.py     # 주간/월간 요약 날짜 범위 계산
+│  ├─ pricing.py            # (실험적, 미연결) KST 정밀 비용 계산기 — 아래 참고
+│  ├─ kst_bucket.py         # (실험적, 미연결) KST 캘린더 날짜 ↔ UTC 시간 변환
 │  └─ telegram.py           # 발송 + 에러 알림
 ├─ subscriptions.json
 ├─ budget.json              # 월 예산 한도 설정 (없으면 예산 경고 기능 자체가 생략됨)
+├─ prices.json              # (실험적, 미연결) 모델별 토큰 단가표
 ├─ requirements.txt
 ├─ PLAN.md                  # 세션별 개발 계획 + 2단계 백로그
 └─ README.md                # 이 문서
@@ -134,6 +137,23 @@ python src/report.py
 DB 없이 그날그날 Anthropic/OpenAI 비용 API에 해당 기간을 다시 질의하는 방식이라 별도 저장소가
 필요 없습니다(`src/weekly_monthly.py`가 날짜 범위 계산, `src/providers/*.py`의
 `get_cost_for_range()`가 조회).
+
+## KST 정밀 비용 계산 (진행 중, 아직 실제 리포트에 연결 안 됨)
+
+지금 리포트의 "어제/이번 달" 숫자는 **UTC 자정 기준**입니다. Anthropic Cost API·OpenAI Costs API
+둘 다 하루(1d) 단위 버킷만 지원하고 그 하루가 UTC 자정에 고정돼 있어서, Cost API만으로는 KST
+자정에 정확히 맞출 방법이 없습니다(2단계 세션 2 조사 결과, `PLAN.md` 참고).
+
+대안으로 시간(1h) 단위를 지원하는 **Usage API**(토큰 개수)를 받아와 직접 관리하는 단가표
+(`prices.json`)로 USD를 계산하는 방식을 준비 중입니다. 다만 실제 단가 체계가 캐시 요율·컨텍스트
+길이·배치 할인 등으로 복잡해서, 우선 **input/output/캐시 읽기 + 5분 캐시 쓰기만 반영한 간소화판**
+(`src/pricing.py`, `prices.json`)으로 범위를 좁혔습니다. `prices.json`의 가격은 수동으로 유지해야
+하며, 특히 Claude Sonnet 5는 2026-09-01에 프로모션 요율이 끝나므로 그 이후엔 직접 갱신이 필요합니다.
+
+`src/pricing.py`(가격 계산)와 `src/kst_bucket.py`(KST 날짜 ↔ UTC 시간 변환)는 합성 데이터로
+정확성이 검증됐지만, 아직 실제 Anthropic/OpenAI Usage API를 호출하는 코드가 없고 `report.py`에도
+연결되지 않았습니다 — 기존 발송 경로에는 영향이 없습니다. 다음 세션에서 실제 API 연동 후, 리포트에
+"KST 정밀 어제 비용(실험적)"으로 기존 UTC 섹션과 나란히 추가할 예정입니다.
 
 ## 알려진 이슈 / 주의사항
 

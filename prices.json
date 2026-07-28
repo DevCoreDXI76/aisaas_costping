@@ -1,0 +1,28 @@
+{
+  "_readme": [
+    "USD / 1,000,000 tokens. 5분 프롬프트 캐시 쓰기(cache_write_5m) 요율 기준의 간소화판입니다.",
+    "1시간 캐시 쓰기 요율, 20만 토큰 초과 컨텍스트 요율, 배치(batch) 50% 할인, 데이터 레지던시 +10%는",
+    "이 표에 반영되지 않습니다 — 해당 사용량이 감지되면 src/pricing.py가 리포트에 경고를 남기고",
+    "그 부분은 근사치(캐시 미포함 기준 등)로 계산합니다.",
+    "모델 키는 실제 API가 돌려주는 모델 ID 문자열의 '접두사(prefix)'로 매칭합니다.",
+    "정확한 모델 ID 문자열은 2단계 세션 B(Anthropic Usage API 실동 연동)에서 실제 응답을 보고 확정합니다.",
+    "가격이 바뀌면 아래 공식 페이지에서 확인 후 직접 수정하세요:",
+    "  Anthropic: https://platform.claude.com/docs/en/about-claude/pricing",
+    "  OpenAI:    https://openai.com/api/pricing/",
+    "주의: Claude Sonnet 5는 2026-07-28 기준 프로모션 요율이며 2026-09-01부터 표준 요율(input $3 / output $15)로",
+    "자동 전환됩니다 — 그 시점 이후엔 이 파일의 claude-sonnet-5 값도 직접 갱신해야 합니다."
+  ],
+  "as_of": "2026-07-28",
+  "anthropic": {
+    "claude-opus-5":     { "input": 5, "output": 25, "cache_write_5m": 6.25, "cache_read": 0.5 },
+    "claude-opus-4":      { "input": 5, "output": 25, "cache_write_5m": 6.25, "cache_read": 0.5 },
+    "claude-sonnet-5":   { "input": 2, "output": 10, "cache_write_5m": 2.5,  "cache_read": 0.2 },
+    "claude-sonnet-4":    { "input": 3, "output": 15, "cache_write_5m": 3.75, "cache_read": 0.3 },
+    "claude-haiku-4":     { "input": 1, "output": 5,  "cache_write_5m": 1.25, "cache_read": 0.1 }
+  },
+  "openai": {
+    "gpt-5.6-sol":   { "input": 5,   "output": 30, "cached_input": 0.5 },
+    "gpt-5.6-terra": { "input": 2.5, "output": 15, "cached_input": 0.25 },
+    "gpt-5.6-luna":  { "input": 1,   "output": 6,  "cached_input": 0.1 }
+  }
+}
