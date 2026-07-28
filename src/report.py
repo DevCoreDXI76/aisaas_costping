@@ -1,13 +1,12 @@
 """
-CostPing 진입점 (세션 2 버전: 구독 알림 + Anthropic 비용).
-
-OpenAI 비용 수집은 세션 3에서 이 파일에 추가될 예정.
+CostPing 진입점 (세션 3 버전: 구독 알림 + Anthropic 비용 + OpenAI 비용).
 
 로컬 테스트:
   1) 프로젝트 루트에 .env 파일을 만들고 아래처럼 채운다 (커밋 금지, .gitignore에 포함됨)
        TELEGRAM_BOT_TOKEN=...
        TELEGRAM_CHAT_ID=...
        ANTHROPIC_ADMIN_KEY=...
+       OPENAI_ADMIN_KEY=...
   2) python src/report.py 실행
 
 GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로 동작한다.
@@ -25,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import telegram  # noqa: E402
 import subscriptions as subs_mod  # noqa: E402
-from providers import anthropic_cost  # noqa: E402
+from providers import anthropic_cost, openai_cost  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -65,24 +64,50 @@ def build_subscription_section(due_today: list[dict], due_tomorrow: list[dict]) 
     return "\n".join(lines)
 
 
+def _fetch_provider_cost(provider_module, config_error_cls):
+    """제공사 비용 조회 헬퍼. 성공하면 (yesterday_usd, month_usd, None) 실패하면 (0, 0, 경고문구)를 반환.
+    한 제공사가 실패해도 나머지는 정상 발송되도록 예외를 여기서 흡수한다."""
+    try:
+        yesterday_usd, month_usd = provider_module.get_yesterday_and_month_to_date_cost()
+        return yesterday_usd, month_usd, None
+    except config_error_cls as e:
+        return 0.0, 0.0, f"건너뜀: {e}"
+    except Exception as e:
+        return 0.0, 0.0, f"조회 실패: {e}"
+
+
 def build_cost_section() -> str:
     """
-    Anthropic 비용 섹션. API 호출이 실패해도 전체 리포트가 죽지 않도록
-    여기서 예외를 잡고 실패 문구를 대신 넣는다 (OpenAI는 세션 3에서 합류 예정).
+    Anthropic + OpenAI 비용 섹션. 한쪽 API가 실패해도 나머지는 정상 표시되고,
+    전체 리포트(구독 알림 포함)는 죽지 않는다.
     """
-    try:
-        yesterday_usd, month_to_date_usd = anthropic_cost.get_yesterday_and_month_to_date_cost()
-    except anthropic_cost.AnthropicConfigError as e:
-        return f"⚠️ API 비용 조회 건너뜀: {e}"
-    except Exception as e:
-        return f"⚠️ Anthropic 비용 조회 실패: {e}"
+    a_yesterday, a_month, a_error = _fetch_provider_cost(
+        anthropic_cost, anthropic_cost.AnthropicConfigError
+    )
+    o_yesterday, o_month, o_error = _fetch_provider_cost(
+        openai_cost, openai_cost.OpenAIConfigError
+    )
 
-    lines = [
-        "어제 API 비용 (UTC 기준)",
-        f"· Anthropic  {format_currency(yesterday_usd, 'USD')}",
-        "",
-        f"이번 달 누적: {format_currency(month_to_date_usd, 'USD')} (Anthropic만)",
-    ]
+    lines = ["어제 API 비용 (UTC 기준)"]
+    if a_error:
+        lines.append(f"· Anthropic  ⚠️ {a_error}")
+    else:
+        lines.append(f"· Anthropic  {format_currency(a_yesterday, 'USD')}")
+    if o_error:
+        lines.append(f"· OpenAI     ⚠️ {o_error}")
+    else:
+        lines.append(f"· OpenAI     {format_currency(o_yesterday, 'USD')}")
+
+    if not a_error or not o_error:
+        yesterday_total = a_yesterday + o_yesterday
+        month_total = a_month + o_month
+        note = ""
+        if a_error or o_error:
+            note = " (일부 제공사 조회 실패, 부분 합계)"
+        lines.append(f"· 합계        {format_currency(yesterday_total, 'USD')}{note}")
+        lines.append("")
+        lines.append(f"이번 달 누적: {format_currency(month_total, 'USD')}{note}")
+
     return "\n".join(lines)
 
 
@@ -97,7 +122,6 @@ def build_report() -> str:
     due_today, due_tomorrow = subs_mod.get_due_today_and_tomorrow(subs)
     subscription_section = build_subscription_section(due_today, due_tomorrow)
 
-    # 세션 3에서 여기 OpenAI 비용이 cost_section에 합류할 예정
     return f"{header}\n\n{cost_section}\n\n{subscription_section}"
 
 
