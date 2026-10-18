@@ -9,15 +9,21 @@
     "가격이 바뀌면 아래 공식 페이지에서 확인 후 직접 수정하세요:",
     "  Anthropic: https://platform.claude.com/docs/en/about-claude/pricing",
     "  OpenAI:    https://openai.com/api/pricing/",
-    "주의: Claude Sonnet 5는 2026-07-28 기준 프로모션 요율이며 2026-09-01부터 표준 요율(input $3 / output $15)로",
-    "자동 전환됩니다 — 그 시점 이후엔 이 파일의 claude-sonnet-5 값도 직접 갱신해야 합니다."
+    "참고: Claude Sonnet 5의 $2/$10은 출시 당시 프로모션가였으나 표준가로 확정됨(9/1 인상 취소, 2026-10-18 확인).",
+    "주의: 접두사 매칭이라 '-5-5'/'-5-1' 같은 후속 모델은 반드시 별도 키로 둬야 함(없으면 '-5' 키 단가로 잘못 계산됨).",
+    "claude-haiku-5-5는 100K 토큰 이하 프롬프트 요율 기준(초과 시 input $0.50 / output $2.50)."
   ],
-  "as_of": "2026-07-28",
+  "as_of": "2026-10-18",
   "anthropic": {
+    "claude-fable-5-1":  { "input": 10, "output": 50, "cache_write_5m": 12.5, "cache_read": 0.25 },
+    "claude-fable-5":    { "input": 10, "output": 50, "cache_write_5m": 12.5, "cache_read": 1 },
+    "claude-opus-5-5":   { "input": 4, "output": 20, "cache_write_5m": 5,    "cache_read": 0.2 },
     "claude-opus-5":     { "input": 5, "output": 25, "cache_write_5m": 6.25, "cache_read": 0.5 },
     "claude-opus-4":      { "input": 5, "output": 25, "cache_write_5m": 6.25, "cache_read": 0.5 },
+    "claude-sonnet-5-5": { "input": 2, "output": 10, "cache_write_5m": 2.5,  "cache_read": 0.1 },
     "claude-sonnet-5":   { "input": 2, "output": 10, "cache_write_5m": 2.5,  "cache_read": 0.2 },
     "claude-sonnet-4":    { "input": 3, "output": 15, "cache_write_5m": 3.75, "cache_read": 0.3 },
+    "claude-haiku-5-5":  { "input": 0.1, "output": 0.5, "cache_write_5m": 0.125, "cache_read": 0.01 },
     "claude-haiku-4":     { "input": 1, "output": 5,  "cache_write_5m": 1.25, "cache_read": 0.1 }
   },
   "openai": {
