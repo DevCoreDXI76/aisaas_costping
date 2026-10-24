@@ -129,6 +129,10 @@ aisaas_costping/
 - **Google Gemini API 비용 추가** (2026-07-27 조사): Anthropic/OpenAI처럼 간단한 Admin API 키로 비용 조회 불가. AI Studio 대시보드 전용, 프로그래밍 조회는 GCP Cloud Billing BigQuery Export 구축 필요(별도 GCP 프로젝트 연결 + 서비스 계정 + BigQuery 쿼리) — MVP 아키텍처(서버 없는 GitHub Actions 스크립트)와 무게감이 다름
 - **Voyage AI 비용 추가** (2026-07-27 조사): MongoDB Atlas 산하로 통합됨. 공개 REST 비용/사용량 API 없음, Atlas UI(Usage/Cost Explorer/Invoices)로만 확인 가능. 프로그래밍 연동은 MongoDB에 별도 문의 필요
 - 기타 제공사 추가
+- **"🧪 KST 정밀" 섹션과 UTC 섹션 통합 여부** (2026-10-24 기록): 프로젝트별 비용 섹션을 cost_report와
+  정확히 대조하기 위해 UTC 기준으로 정했다(KST로는 cost_report 1d 버킷과 대조 불가). 그 결과 리포트에
+  UTC 기준(합계·프로젝트별)과 KST 기준(실험 섹션)이 공존한다. 실험 섹션 유지/제거/통합은 별도 판단
+- 프로젝트별 비용 2단계: 일일 스냅샷 `data/daily/*.json` 커밋, 웹 대시보드, `/stats` 즉시 조회, 자동 비용 절감 진단 규칙
 
 > ~~월 예산 초과 경고, 주간/월간 요약 리포트~~ → 2단계 세션 1에서 완료 (아래 7번 참고)
 > ~~KST 정밀 일 경계~~ → 2단계 세션 2(세션 A~C)에서 완료. "🧪 KST 정밀 어제 비용(실험적)" 섹션으로

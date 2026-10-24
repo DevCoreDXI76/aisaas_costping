@@ -30,9 +30,11 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kst_bucket  # noqa: E402
 import pricing  # noqa: E402
+import project_map  # noqa: E402
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
+NO_KEY_LABEL = "키 없음(Console 등)"  # api_key_id가 null인 사용량(Console/Workbench 등)
 
 
 class AnthropicConfigError(RuntimeError):
@@ -140,10 +142,11 @@ def get_kst_precise_cost_for_day(
     하루의 비용을 prices.json 단가표 기준으로 계산한다. cost_report 기반 함수들과
     달리 진짜 KST 자정에 맞는 하루를 계산한다(kst_bucket.kst_day_to_utc_range).
 
-    간소화판 단가표가 반영하지 않는 사용량(1시간 캐시 쓰기, service_tier가 standard가
-    아닌 경우, context_window 명시, 웹 검색 도구 사용 등)을 만나면 비용 계산에서
-    빼거나 근사치로 두고 경고 문구를 남긴다 — 실제 청구 금액보다 살짝 낮게 나올 수
-    있다는 뜻. 단가표에 아예 없는 모델을 만나면 그 모델분은 0으로 집계에서 빠진다.
+    1시간 캐시 쓰기와 웹 검색 도구 사용료는 prices.json 단가로 계산에 포함한다.
+    간소화판 단가표가 반영하지 않는 사용량(service_tier가 standard가 아닌 경우,
+    context_window 명시 등)을 만나면 근사치로 두고 경고 문구를 남긴다 — 실제 청구
+    금액보다 살짝 낮게 나올 수 있다는 뜻. 단가표에 아예 없는 모델을 만나면 그 모델분은
+    0으로 집계에서 빠진다.
 
     Returns:
         (총 비용 USD, 경고 문구 리스트) — 경고가 있어도 예외를 던지지 않는다
@@ -187,16 +190,10 @@ def get_kst_precise_cost_for_day(
                 cache_write_1h = cache_creation.get("ephemeral_1h_input_tokens") or 0
 
                 cost, warn = pricing.calc_anthropic_cost_usd(
-                    model, uncached_input, output, cache_write_5m, cache_read, prices
+                    model, uncached_input, output, cache_write_5m, cache_read, prices,
+                    cache_write_1h_tokens=cache_write_1h,
                 )
                 acc.add(cost, warn)
-
-                if cache_write_1h:
-                    acc.add(
-                        0.0,
-                        f"{model}: 1시간 캐시 쓰기 {cache_write_1h:,}토큰은 간소화판 단가표에 "
-                        "없어 비용 계산에서 제외됨(실제보다 과소 계산될 수 있음)",
-                    )
 
                 service_tier = result.get("service_tier")
                 if service_tier and service_tier != "standard":
@@ -212,7 +209,7 @@ def get_kst_precise_cost_for_day(
 
                 web_search = (result.get("server_tool_use") or {}).get("web_search_requests") or 0
                 if web_search:
-                    acc.add(0.0, f"{model}: 웹 검색 도구 {web_search}회 사용 감지(별도 과금, 이 계산에 미반영)")
+                    acc.add(pricing.calc_anthropic_web_search_cost_usd(web_search, prices))
 
         if body.get("has_more") and body.get("next_page"):
             page = body["next_page"]
@@ -220,6 +217,141 @@ def get_kst_precise_cost_for_day(
             break
 
     return acc.total_usd, acc.warnings
+
+
+def _get_paginated(path: str, params: dict, api_key: str) -> list[dict]:
+    """Admin API GET을 next_page가 없을 때까지 따라가며 'data'를 전부 합쳐 반환한다."""
+    headers = {
+        "anthropic-version": ANTHROPIC_VERSION,
+        "x-api-key": api_key,
+    }
+    url = f"{ANTHROPIC_API_BASE}{path}"
+    all_data = []
+    page = None
+    while True:
+        p = dict(params)
+        if page:
+            p["page"] = page
+        resp = requests.get(url, headers=headers, params=p, timeout=20)
+        resp.raise_for_status()
+        body = resp.json()
+        all_data.extend(body.get("data", []))
+        if body.get("has_more") and body.get("next_page"):
+            page = body["next_page"]
+        else:
+            return all_data
+
+
+def fetch_api_key_names(api_key: str | None = None) -> dict[str, str]:
+    """{api_key_id: 키 이름}. 보관(archived)된 키도 포함한다 — 지난 사용량이 남아 있을 수 있어서."""
+    api_key = api_key or _get_api_key()
+    keys = _get_paginated("/v1/organizations/api_keys", {"limit": 100}, api_key)
+    return {k["id"]: k.get("name") or k["id"] for k in keys}
+
+
+def fetch_usage_by_key_daily(
+    start_date: date, end_date_exclusive: date, api_key: str | None = None
+) -> list[dict]:
+    """
+    usage_report/messages를 하루(1d, UTC 자정 정렬) 버킷 + group_by[]=api_key_id,model로 조회한다.
+    cost_report와 같은 UTC 날짜 경계라서 키별 추정 합계를 cost_report 합계와 그대로 대조할 수 있다.
+    1d 버킷 기본 limit이 7이라 31을 명시한다(한 달이 한 번에 오도록, 그래도 페이지네이션은 따라감).
+    """
+    api_key = api_key or _get_api_key()
+    return _get_paginated(
+        "/v1/organizations/usage_report/messages",
+        {
+            "starting_at": _iso_z(start_date),
+            "ending_at": _iso_z(end_date_exclusive),
+            "bucket_width": "1d",
+            "limit": 31,
+            "group_by[]": ["api_key_id", "model"],
+        },
+        api_key,
+    )
+
+
+def _aggregate_by_project(buckets: list[dict], key_names: dict[str, str], mapping: dict, prices: dict) -> list[dict]:
+    """usage 버킷들을 표시명(projects.json 매핑 → 키 이름 → 키 ID 순) 단위로 합쳐
+    [{project, provider, cost_usd, models: {model: usd}, tokens}]를 비용 내림차순으로 반환한다.
+    같은 이름의 키(재발급 등)와 같은 표시명으로 매핑된 키는 한 줄로 합쳐진다.
+    단가표에 없는 모델분은 0으로 빠지며, 그 차이는 리포트에서 cost_report 합계와 대조해
+    '미귀속'으로 드러난다."""
+    rows: dict[str, dict] = {}
+    for bucket in buckets:
+        for r in bucket.get("results", []):
+            key_id = r.get("api_key_id")
+            if key_id:
+                key_name = key_names.get(key_id, key_id)
+                project = project_map.display_name("anthropic", key_name, mapping=mapping)
+            else:
+                project = NO_KEY_LABEL
+
+            model = r.get("model") or "(model 필드 없음)"
+            uncached_input = r.get("uncached_input_tokens") or 0
+            output = r.get("output_tokens") or 0
+            cache_read = r.get("cache_read_input_tokens") or 0
+            cache_creation = r.get("cache_creation") or {}
+            cache_write_5m = cache_creation.get("ephemeral_5m_input_tokens") or 0
+            cache_write_1h = cache_creation.get("ephemeral_1h_input_tokens") or 0
+            web_search = (r.get("server_tool_use") or {}).get("web_search_requests") or 0
+
+            cost, _ = pricing.calc_anthropic_cost_usd(
+                model, uncached_input, output, cache_write_5m, cache_read, prices,
+                cache_write_1h_tokens=cache_write_1h,
+            )
+            cost += pricing.calc_anthropic_web_search_cost_usd(web_search, prices)
+
+            row = rows.setdefault(
+                project, {"project": project, "provider": "Anthropic", "cost_usd": 0.0, "models": {}, "tokens": 0}
+            )
+            row["cost_usd"] += cost
+            row["models"][model] = row["models"].get(model, 0.0) + cost
+            row["tokens"] += uncached_input + output + cache_read + cache_write_5m + cache_write_1h
+
+    return sorted(rows.values(), key=lambda x: x["cost_usd"], reverse=True)
+
+
+def _fetch_key_names_safe(api_key: str) -> dict[str, str]:
+    """키 목록 조회가 실패해도 비용 집계는 계속한다(이 경우 키 ID가 그대로 표시됨)."""
+    try:
+        return fetch_api_key_names(api_key)
+    except Exception:
+        return {}
+
+
+def get_cost_by_project(
+    start_date: date, end_date_exclusive: date, api_key: str | None = None
+) -> list[dict]:
+    """[start_date, end_date_exclusive) (UTC 날짜) 구간의 프로젝트(키)별 추정 비용.
+    반환 형식은 _aggregate_by_project 참고. 주간/월간 요약에서 사용."""
+    api_key = api_key or _get_api_key()
+    buckets = fetch_usage_by_key_daily(start_date, end_date_exclusive, api_key)
+    return _aggregate_by_project(
+        buckets, _fetch_key_names_safe(api_key), project_map.load_project_map(), pricing.load_prices()
+    )
+
+
+def get_yesterday_and_month_to_date_cost_by_project(
+    api_key: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """(어제, 이번 달 1일~어제 누적)의 프로젝트별 추정 비용. 기준 시간대는 UTC로
+    get_yesterday_and_month_to_date_cost와 같은 구간이다. usage 조회 1회(+키 목록 1회)로
+    한 달치를 받아 어제 버킷만 따로 골라낸다."""
+    api_key = api_key or _get_api_key()
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    month_start = yesterday.replace(day=1)
+
+    buckets = fetch_usage_by_key_daily(month_start, yesterday + timedelta(days=1), api_key)
+    key_names = _fetch_key_names_safe(api_key)
+    mapping = project_map.load_project_map()
+    prices = pricing.load_prices()
+
+    yesterday_buckets = [b for b in buckets if b.get("starting_at", "").startswith(yesterday.isoformat())]
+    return (
+        _aggregate_by_project(yesterday_buckets, key_names, mapping, prices),
+        _aggregate_by_project(buckets, key_names, mapping, prices),
+    )
 
 
 def _load_dotenv_if_present() -> None:

@@ -15,7 +15,8 @@ OpenAI 비용 수집.
 
 참고(2026-07 기준 커뮤니티 리포트): group_by를 쓰면서 limit을 지정하지 않으면
 next_page 페이지네이션 토큰이 깨지는 버그가 보고된 적이 있어, Costs API 호출부는
-group_by를 쓰지 않고 limit을 항상 명시적으로 지정해 회피한다.
+limit을 항상 명시적으로 지정해 회피한다(합계 함수는 group_by 없이, 프로젝트별 함수는
+group_by=project_id,line_item + limit).
 """
 
 import os
@@ -30,6 +31,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kst_bucket  # noqa: E402
 import pricing  # noqa: E402
+import project_map  # noqa: E402
 
 OPENAI_API_BASE = "https://api.openai.com"
 MAX_LIMIT = 180  # OpenAI가 허용하는 bucket 개수 상한 (한 달 최대 31일이면 충분)
@@ -209,6 +211,116 @@ def get_kst_precise_cost_for_day(
             break
 
     return acc.total_usd, acc.warnings
+
+
+def _get_paginated(path: str, params: dict, api_key: str) -> list[dict]:
+    """Admin API GET을 next_page가 없을 때까지 따라가며 'data'를 전부 합쳐 반환한다."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"{OPENAI_API_BASE}{path}"
+    all_data = []
+    page = None
+    while True:
+        p = dict(params)
+        if page:
+            p["page"] = page
+        resp = requests.get(url, headers=headers, params=p, timeout=20)
+        resp.raise_for_status()
+        body = resp.json()
+        all_data.extend(body.get("data", []))
+        if body.get("has_more") and body.get("next_page"):
+            page = body["next_page"]
+        else:
+            return all_data
+
+
+def fetch_project_names(api_key: str | None = None) -> dict[str, str]:
+    """{project_id: 프로젝트 이름}. 보관된 프로젝트도 포함한다(지난 비용이 남아 있을 수 있어서)."""
+    api_key = api_key or _get_api_key()
+    projects = _get_paginated(
+        "/v1/organization/projects", {"limit": 100, "include_archived": "true"}, api_key
+    )
+    return {p["id"]: p.get("name") or p["id"] for p in projects}
+
+
+def fetch_costs_by_project_daily(start_time: int, end_time: int, api_key: str | None = None) -> list[dict]:
+    """Costs API를 group_by=project_id,line_item으로 조회한다. 모듈 상단 주석의 페이지네이션
+    버그를 피하려고 limit을 항상 명시한다(1d 버킷 상한이라 한 달이 한 번에 온다)."""
+    api_key = api_key or _get_api_key()
+    return _get_paginated(
+        "/v1/organization/costs",
+        {
+            "start_time": start_time,
+            "end_time": end_time,
+            "bucket_width": "1d",
+            "limit": MAX_LIMIT,
+            "group_by": ["project_id", "line_item"],
+        },
+        api_key,
+    )
+
+
+def _aggregate_by_project(buckets: list[dict], project_names: dict[str, str], mapping: dict) -> list[dict]:
+    """Costs 버킷을 표시명(projects.json 매핑 → API 프로젝트 이름 → 프로젝트 ID 순) 단위로 합쳐
+    [{project, provider, cost_usd, models: {model: usd}}]를 비용 내림차순으로 반환한다.
+    Costs API는 실제 청구 금액이라 단가표 추정이 필요 없다. line_item("gpt-5.6-terra, input"
+    형태)의 쉼표 앞부분을 모델명으로 쓴다."""
+    rows: dict[str, dict] = {}
+    for bucket in buckets:
+        for r in bucket.get("results", []):
+            raw_value = (r.get("amount") or {}).get("value")
+            cost = float(raw_value) if raw_value is not None else 0.0
+            project_id = r.get("project_id") or "(프로젝트 없음)"
+            project = project_map.display_name(
+                "openai", project_id, fallback=project_names.get(project_id), mapping=mapping
+            )
+            model = (r.get("line_item") or "(기타)").split(",")[0].strip()
+
+            row = rows.setdefault(project, {"project": project, "provider": "OpenAI", "cost_usd": 0.0, "models": {}})
+            row["cost_usd"] += cost
+            row["models"][model] = row["models"].get(model, 0.0) + cost
+
+    return sorted(rows.values(), key=lambda x: x["cost_usd"], reverse=True)
+
+
+def _fetch_project_names_safe(api_key: str) -> dict[str, str]:
+    """프로젝트 목록 조회가 실패해도 비용 집계는 계속한다(이 경우 프로젝트 ID가 그대로 표시됨)."""
+    try:
+        return fetch_project_names(api_key)
+    except Exception:
+        return {}
+
+
+def _utc_ts(d: date) -> int:
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+
+
+def get_cost_by_project(
+    start_date: date, end_date_exclusive: date, api_key: str | None = None
+) -> list[dict]:
+    """[start_date, end_date_exclusive) (UTC 날짜) 구간의 프로젝트별 비용. 주간/월간 요약에서 사용."""
+    api_key = api_key or _get_api_key()
+    buckets = fetch_costs_by_project_daily(_utc_ts(start_date), _utc_ts(end_date_exclusive), api_key)
+    return _aggregate_by_project(buckets, _fetch_project_names_safe(api_key), project_map.load_project_map())
+
+
+def get_yesterday_and_month_to_date_cost_by_project(
+    api_key: str | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """(어제, 이번 달 1일~어제 누적)의 프로젝트별 비용. get_yesterday_and_month_to_date_cost와
+    같은 UTC 구간을 조회 1회(+프로젝트 목록 1회)로 받아 어제 버킷만 따로 골라낸다."""
+    api_key = api_key or _get_api_key()
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    month_start = yesterday.replace(day=1)
+
+    buckets = fetch_costs_by_project_daily(_utc_ts(month_start), _utc_ts(yesterday + timedelta(days=1)), api_key)
+    project_names = _fetch_project_names_safe(api_key)
+    mapping = project_map.load_project_map()
+
+    yesterday_buckets = [b for b in buckets if b.get("start_time") == _utc_ts(yesterday)]
+    return (
+        _aggregate_by_project(yesterday_buckets, project_names, mapping),
+        _aggregate_by_project(buckets, project_names, mapping),
+    )
 
 
 def _load_dotenv_if_present() -> None:

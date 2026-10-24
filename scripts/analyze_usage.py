@@ -71,8 +71,8 @@ try:
             m = r.get("model") or "?"
             ui = r.get("uncached_input_tokens") or 0; o = r.get("output_tokens") or 0
             cr = r.get("cache_read_input_tokens") or 0
-            cc = r.get("cache_creation") or {}; cw = (cc.get("ephemeral_5m_input_tokens") or 0)+(cc.get("ephemeral_1h_input_tokens") or 0)
-            c,_ = pricing.calc_anthropic_cost_usd(m, ui, o, cw, cr, prices)
+            cc = r.get("cache_creation") or {}; cw5 = cc.get("ephemeral_5m_input_tokens") or 0; cw1h = cc.get("ephemeral_1h_input_tokens") or 0; cw = cw5+cw1h
+            c,_ = pricing.calc_anthropic_cost_usd(m, ui, o, cw5, cr, prices, cache_write_1h_tokens=cw1h)
             c = c or 0
             d = bykey[k]; d["cost"]+=c; d["models"][m]+=c; d["hour_kst"][hs.hour]+=c
             if hs.weekday()>=5: d["weekend"]+=c

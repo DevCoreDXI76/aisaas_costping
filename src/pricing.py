@@ -7,8 +7,8 @@ Anthropic/OpenAI Usage API 원본 응답을 이 형태로 정규화하는 작업
 있지 않다 — "KST 정밀 비용" 기능의 계산 엔진만 먼저 만들고 검증하는 단계.
 
 가격표(prices.json) 스키마와 반영 범위/한계는 prices.json의 "_readme"를 참고.
-요약: 5분 프롬프트 캐시 쓰기 요율 기준 간소화판. 1시간 캐시 쓰기, 20만 토큰 초과
-컨텍스트, 배치 50% 할인, 데이터 레지던시 +10%는 반영하지 않는다 — 대신 해당
+요약: 5분·1시간 프롬프트 캐시 쓰기와 웹 검색 도구 사용료까지 반영한 간소화판. 20만 토큰
+초과 컨텍스트, 배치 50% 할인, 데이터 레지던시 +10%, 빠른 모드는 반영하지 않는다 — 대신 해당
 사용량이 감지되면 경고를 남기고 그 부분은 근사치로 처리한다(0으로 세지 않고
 가능한 필드만 사용).
 
@@ -64,22 +64,34 @@ def calc_anthropic_cost_usd(
     cache_creation_input_tokens: int,
     cache_read_input_tokens: int,
     prices: dict,
+    cache_write_1h_tokens: int = 0,
 ) -> tuple[float, str | None]:
     """
-    Anthropic 토큰 개수를 USD로 환산한다 (5분 캐시 쓰기 요율 기준 간소화판).
+    Anthropic 토큰 개수를 USD로 환산한다.
+    cache_creation_input_tokens는 5분 캐시 쓰기, cache_write_1h_tokens는 1시간 캐시 쓰기
+    토큰이다(usage 응답의 cache_creation.ephemeral_5m/1h_input_tokens). 1시간 캐시 단가는
+    prices.json의 cache_write_1h를 쓰고, 없으면 공식 배율(기본 입력 단가의 2배)로 계산한다.
     Returns: (비용 USD, 경고문구 또는 None). 단가표에 없는 모델이면 (0.0, 경고).
     """
     entry = _find_price_entry(prices.get("anthropic", {}), model)
     if entry is None:
         return 0.0, f"단가표에 없는 Anthropic 모델: {model} (해당 사용량은 집계에서 제외됨)"
 
+    cache_write_1h_rate = entry.get("cache_write_1h", entry["input"] * 2)
     cost = (
         uncached_input_tokens * entry["input"]
         + output_tokens * entry["output"]
         + cache_creation_input_tokens * entry["cache_write_5m"]
+        + cache_write_1h_tokens * cache_write_1h_rate
         + cache_read_input_tokens * entry["cache_read"]
     ) / 1_000_000
     return cost, None
+
+
+def calc_anthropic_web_search_cost_usd(web_search_requests: int, prices: dict) -> float:
+    """Anthropic 웹 검색 도구 사용료(토큰 비용과 별도, 검색 1회당 과금)를 USD로 환산한다."""
+    per_1k = prices.get("anthropic_server_tools", {}).get("web_search_per_1k", 10)
+    return web_search_requests * per_1k / 1000
 
 
 def calc_openai_cost_usd(
