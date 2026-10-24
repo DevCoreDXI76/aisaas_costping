@@ -125,15 +125,17 @@ def _fetch_provider_range_cost(provider_module, config_error_cls, start, end):
         return 0.0, f"조회 실패: {e}"
 
 
-def build_cost_section() -> tuple[str, float | None, float | None]:
+def build_cost_section() -> tuple[str, float | None, float | None, dict[str, float | None]]:
     """
     Anthropic + OpenAI 비용 섹션. 한쪽 API가 실패해도 나머지는 정상 표시되고,
     전체 리포트(구독 알림 포함)는 죽지 않는다.
 
     Returns:
-        (섹션 텍스트, 어제 하루 비용 USD 또는 None, 이번 달 누적 비용 USD 또는 None)
+        (섹션 텍스트, 어제 하루 비용 USD 또는 None, 이번 달 누적 비용 USD 또는 None,
+        {제공사명: 어제 비용 USD 또는 None(조회 실패)})
         두 제공사 모두 실패하면 둘 다 None(계산 불가). yesterday_total/month_total은
-        budget.py의 하루/월 예산 경고 계산에 재사용한다.
+        budget.py의 하루/월 예산 경고 계산에, 제공사별 어제 비용은 프로젝트별 섹션의
+        '미귀속' 계산에 재사용한다(같은 cost_report 결과라 추가 API 호출 없음).
     """
     a_yesterday, a_month, a_error = _fetch_provider_cost(
         anthropic_cost, anthropic_cost.AnthropicConfigError
@@ -164,7 +166,143 @@ def build_cost_section() -> tuple[str, float | None, float | None]:
         lines.append("")
         lines.append(f"이번 달 누적: {format_currency(month_total, 'USD')}{note}")
 
-    return "\n".join(lines), yesterday_total, month_total
+    provider_yesterday = {
+        "Anthropic": None if a_error else a_yesterday,
+        "OpenAI": None if o_error else o_yesterday,
+    }
+    return "\n".join(lines), yesterday_total, month_total, provider_yesterday
+
+
+PROJECT_SECTION_MAX_ROWS = 5  # 비용 상위 N개 프로젝트만 표시, 나머지는 "기타"로 묶음
+MESSAGE_SAFE_LIMIT = 3800  # 텔레그램 4096자 제한에 여유를 둔 상한(넘으면 프로젝트 줄을 줄임)
+MIN_SHOWN_USD = 0.01  # 이보다 작은 줄(프로젝트·키 없음·미귀속)은 숨김
+
+
+def _fetch_provider_projects(provider_module, config_error_cls) -> dict:
+    """제공사 프로젝트별 비용 조회 헬퍼. 다른 _fetch_* 헬퍼와 같은 방어 패턴:
+    키 미설정이면 skipped(위 합계 섹션에서 이미 "건너뜀"이 표시되므로 여기선 조용히 생략),
+    그 밖의 예외는 error 문구로 돌려준다."""
+    try:
+        yesterday_rows, month_rows = provider_module.get_yesterday_and_month_to_date_cost_by_project()
+        return {"yesterday": yesterday_rows, "month": month_rows, "error": None, "skipped": False}
+    except config_error_cls:
+        return {"yesterday": [], "month": [], "error": None, "skipped": True}
+    except Exception as e:
+        return {"yesterday": [], "month": [], "error": str(e)[:150], "skipped": False}
+
+
+def fetch_project_costs() -> dict[str, dict]:
+    """{제공사명: _fetch_provider_projects 결과}. 한 제공사가 실패해도 다른 쪽은 그대로 쓴다."""
+    return {
+        "Anthropic": _fetch_provider_projects(anthropic_cost, anthropic_cost.AnthropicConfigError),
+        "OpenAI": _fetch_provider_projects(openai_cost, openai_cost.OpenAIConfigError),
+    }
+
+
+def _short_model_name(model: str) -> str:
+    """'claude-sonnet-5' / 'claude-haiku-4-5-20251001' -> 'Sonnet' / 'Haiku'. OpenAI 등은 그대로."""
+    name = model.removeprefix("claude-")
+    for family in ("fable", "mythos", "opus", "sonnet", "haiku"):
+        if name.startswith(family):
+            return family.capitalize()
+    return model
+
+
+def _format_model_shares(models: dict[str, float], total: float, top_n: int = 3) -> str:
+    """{모델: USD} -> 'Sonnet 61% · Haiku 39%' (모델 계열별로 합치고 1% 미만은 생략)."""
+    if total <= 0:
+        return ""
+    by_family: dict[str, float] = {}
+    for model, usd in models.items():
+        family = _short_model_name(model)
+        by_family[family] = by_family.get(family, 0.0) + usd
+    shares = sorted(by_family.items(), key=lambda x: x[1], reverse=True)
+    parts = [f"{name} {usd / total * 100:.0f}%" for name, usd in shares if usd / total >= 0.01]
+    return " · ".join(parts[:top_n])
+
+
+def build_project_section(
+    project_costs: dict[str, dict],
+    provider_yesterday: dict[str, float | None],
+    max_rows: int = PROJECT_SECTION_MAX_ROWS,
+) -> str | None:
+    """
+    "🗂 프로젝트별 (어제, UTC)" 섹션 텍스트. 조회는 하지 않는 순수 포맷 함수 — 메시지가
+    길면 build_report가 max_rows를 줄여 다시 부를 수 있게 분리했다.
+
+    - 어제 비용 상위 max_rows개 프로젝트를 금액 내림차순으로, 나머지(및 $0.01 미만 줄)는 "기타"로
+    - 각 줄: 표시명 (제공사) 어제 금액 — 모델 계열 비중 | 이번 달 누적
+    - 미귀속 = 제공사별 cost_report 어제 합계 - 프로젝트별 추정 합계. 단가표에 없는 모델·요금
+      항목, 키 없이 쓴 사용량 집계 누락분 등이 여기 드러난다. 합계 조회가 실패한 제공사는 계산 제외
+    - 두 제공사 다 키 미설정이면 None(섹션 생략)
+    """
+    if all(p["skipped"] for p in project_costs.values()):
+        return None
+
+    errors = {name: p["error"] for name, p in project_costs.items() if p["error"]}
+    active = {name: p for name, p in project_costs.items() if not p["error"] and not p["skipped"]}
+    if not active:
+        detail = " / ".join(f"{name}: {err}" for name, err in errors.items())
+        return f"⚠️ 프로젝트별 비용 조회 실패: {detail}"
+
+    rows = []
+    unattributed = 0.0
+    for provider, p in active.items():
+        month_by_project = {r["project"]: r["cost_usd"] for r in p["month"]}
+        for r in p["yesterday"]:
+            rows.append({**r, "month_usd": month_by_project.get(r["project"], r["cost_usd"])})
+        provider_total = provider_yesterday.get(provider)
+        if provider_total is not None:
+            unattributed += provider_total - sum(r["cost_usd"] for r in p["yesterday"])
+    rows.sort(key=lambda r: r["cost_usd"], reverse=True)
+
+    visible = [r for r in rows if r["cost_usd"] >= MIN_SHOWN_USD]
+    shown, rest = visible[:max_rows], visible[max_rows:] + [r for r in rows if r["cost_usd"] < MIN_SHOWN_USD]
+
+    lines = ["🗂 프로젝트별 (어제, UTC)"]
+    for r in shown:
+        shares = _format_model_shares(r["models"], r["cost_usd"])
+        shares_text = f" — {shares}" if shares else ""
+        lines.append(
+            f"· {r['project']} ({r['provider']}) {format_currency(r['cost_usd'], 'USD')}"
+            f"{shares_text} | 월 {format_currency(r['month_usd'], 'USD')}"
+        )
+
+    rest_usd = sum(r["cost_usd"] for r in rest)
+    if rest_usd >= MIN_SHOWN_USD:
+        rest_month = sum(r["month_usd"] for r in rest)
+        lines.append(
+            f"· 기타 {len(rest)}개 {format_currency(rest_usd, 'USD')} | 월 {format_currency(rest_month, 'USD')}"
+        )
+
+    if unattributed >= MIN_SHOWN_USD:
+        lines.append(f"· 미귀속 {format_currency(unattributed, 'USD')} (단가표 밖 사용분 등)")
+    elif unattributed <= -MIN_SHOWN_USD:
+        lines.append(f"⚠️ 추정이 청구액보다 {format_currency(-unattributed, 'USD')} 많음 (prices.json 확인 필요)")
+
+    if len(lines) == 1:
+        lines.append("· 어제 사용 없음")
+
+    for name, err in errors.items():
+        lines.append(f"⚠️ {name} 프로젝트별 조회 실패: {err}")
+
+    return "\n".join(lines)
+
+
+def _build_project_section_safe(
+    project_costs: dict[str, dict], provider_yesterday: dict[str, float | None], max_rows: int
+) -> str | None:
+    """포맷 중 예상 못 한 에러가 나도 이 섹션만 경고로 바뀌고 리포트는 정상 발송된다
+    (조회 실패는 fetch_project_costs가 제공사별로 이미 흡수함)."""
+    try:
+        return build_project_section(project_costs, provider_yesterday, max_rows)
+    except Exception as e:
+        return f"⚠️ 프로젝트별 비용 조회 실패: {str(e)[:150]}"
+
+
+def _telegram_length(text: str) -> int:
+    """텔레그램 글자 수 제한은 UTF-16 코드 단위 기준이다(이모지 1개 = 2)."""
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _build_subscription_section_safe() -> str:
@@ -450,7 +588,7 @@ def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[st
     weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][now.weekday()]
     header = f"📊 CostPing — {now.month}/{now.day}({weekday_kr})"
 
-    cost_text, yesterday_total, month_total = build_cost_section()
+    cost_text, yesterday_total, month_total, provider_yesterday = build_cost_section()
     subscription_section = _build_subscription_section_safe()
 
     sections = [header]
@@ -461,6 +599,14 @@ def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[st
         sections.append(reply_text)
 
     sections.append(cost_text)
+
+    # 프로젝트별 섹션 — 합계 섹션 바로 아래. 메시지가 길면 아래에서 줄 수를 줄여 다시 만든다.
+    project_costs = fetch_project_costs()
+    project_max_rows = PROJECT_SECTION_MAX_ROWS
+    project_text = _build_project_section_safe(project_costs, provider_yesterday, project_max_rows)
+    project_index = len(sections)
+    if project_text:
+        sections.append(project_text)
 
     if yesterday_total is not None or month_total is not None:
         budget_text = budget.build_budget_section_safe(yesterday_total, month_total)
@@ -486,6 +632,16 @@ def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[st
         sections.append(monthly_text)
 
     sections.extend(_build_subscription_review_sections_safe(today, force_monthly))
+
+    # 안전장치: 텔레그램 4096자 제한 전에 프로젝트 줄을 하나씩 줄인다(넘친 프로젝트는 "기타"로 합쳐짐).
+    while (
+        project_text
+        and project_max_rows > 0
+        and _telegram_length("\n\n".join(sections)) > MESSAGE_SAFE_LIMIT
+    ):
+        project_max_rows -= 1
+        project_text = _build_project_section_safe(project_costs, provider_yesterday, project_max_rows)
+        sections[project_index] = project_text
 
     return "\n\n".join(sections), keyboard
 
