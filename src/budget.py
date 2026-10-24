@@ -3,9 +3,10 @@
 
 budget.json 스키마 (프로젝트 루트, notion_config.json과 동일한 레벨):
 {
-  "daily_budget_usd": 5,          # 어제 하루 API 비용(Anthropic+OpenAI 합계) 한도, USD
-  "monthly_budget_usd": 60,       # 이번 달 API 비용(Anthropic+OpenAI 합계) 한도, USD
-  "warning_threshold_pct": 80     # 이 %를 넘으면 경고, 100% 넘으면 "초과" 경고로 문구가 바뀜 (하루/월 공통)
+  "daily_budget_usd": 1,          # 어제 하루 API 비용(Anthropic+OpenAI 합계) 한도, USD
+  "monthly_budget_usd": 15,       # 이번 달 API 비용(Anthropic+OpenAI 합계) 한도, USD
+  "warning_threshold_pct": 80,    # 이 %를 넘으면 경고, 100% 넘으면 "초과" 경고로 문구가 바뀜 (하루/월 공통)
+  "usd_krw": 1400                 # 구독 월 고정비 원화 환산용 고정 환율 (분기마다 사람이 갱신)
 }
 
 주의: 이 예산은 Notion에 등록된 구독 결제액(OTT/AI 정액 구독 등, src/providers/notion_subscriptions.py)과는
@@ -19,6 +20,7 @@ import json
 from pathlib import Path
 
 DEFAULT_BUDGET_PATH = Path(__file__).resolve().parent.parent / "budget.json"
+DEFAULT_USD_KRW = 1400  # budget.json에 usd_krw가 없거나 파일을 못 읽을 때 쓰는 fallback 환율
 
 
 class BudgetConfigError(RuntimeError):
@@ -28,6 +30,16 @@ class BudgetConfigError(RuntimeError):
 def load_budget(path: Path = DEFAULT_BUDGET_PATH) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_usd_krw(path: Path = DEFAULT_BUDGET_PATH) -> float:
+    """budget.json의 usd_krw(고정 환율)를 반환한다. 파일/키가 없거나 깨졌으면 DEFAULT_USD_KRW.
+    환율 하나 때문에 월간 구독 섹션 전체가 죽지 않도록 예외는 여기서 흡수한다."""
+    try:
+        value = load_budget(path).get("usd_krw")
+    except Exception:
+        return DEFAULT_USD_KRW
+    return value if isinstance(value, (int, float)) and value > 0 else DEFAULT_USD_KRW
 
 
 def _build_single_warning(label: str, used_usd: float, limit: float, threshold_pct: float) -> str | None:
@@ -92,6 +104,6 @@ def build_budget_section_safe(
 
 
 if __name__ == "__main__":
-    cfg = {"daily_budget_usd": 5, "monthly_budget_usd": 60, "warning_threshold_pct": 80}
-    for y, m in [(1, 10), (4.5, 55), (5.94, 71.27), (0.5, 30)]:
+    cfg = {"daily_budget_usd": 1, "monthly_budget_usd": 15, "warning_threshold_pct": 80}
+    for y, m in [(0.2, 3), (0.85, 12.5), (1.2, 16.1), (0.1, 5)]:
         print(f"어제 ${y} / 이번달 ${m} ->", build_budget_warnings(y, m, cfg))

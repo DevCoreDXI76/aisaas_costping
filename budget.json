@@ -1,5 +1,6 @@
 {
-  "daily_budget_usd": 5,
-  "monthly_budget_usd": 60,
-  "warning_threshold_pct": 80
+  "daily_budget_usd": 1,
+  "monthly_budget_usd": 15,
+  "warning_threshold_pct": 80,
+  "usd_krw": 1400
 }

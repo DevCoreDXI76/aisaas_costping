@@ -10,6 +10,10 @@ CostPing 진입점 (2단계 세션 3 버전: MVP + 월 예산 초과 경고 + �
        OPENAI_ADMIN_KEY=...
        NOTION_API_KEY=...
   2) python src/report.py 실행
+     - --dry-run: 텔레그램 발송 없이 콘솔 출력만(지난 D-3 버튼 응답 처리도 건너뜀 —
+       로컬 확인만으로 실제 응답이 소비돼 다음 cron에서 사라지지 않게 하기 위함)
+     - COSTPING_FORCE_MONTHLY=1: 오늘이 1일이 아니어도 월간 섹션(지난달 요약 +
+       회사/개인 구독) 생성. Actions에서는 workflow_dispatch의 force_monthly 입력으로 켠다.
 
 GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로 동작한다.
 
@@ -36,13 +40,13 @@ GitHub Actions에서는 .env 없이 Secrets → env로 주입되므로 그대로
     src/providers/notion_subscriptions.py의 get_due_in_days/update_last_used_date).
     웹훅 서버 없이 매일 08:00 폴링만으로 처리하기 때문에 응답 반영까지 최대 24시간
     지연될 수 있다 — "서버 없음" 아키텍처를 지키기 위해 의도적으로 감수한 트레이드오프.
-  - 매월 1일 "지난달 요약" 아래에 "🧟 3개월 이상 미이용 추정 구독" 하이라이트 추가
-    (2단계 세션 3(선택)): "마지막 이용일"(또는 그마저 없으면 결제 시작일)로부터 3개월
-    이상 지난 활성 구독을 모아 보여준다. D-3 알림에 응답을 안 하고 넘어가면 놓치기
-    쉬운 좀비 구독을 한 달에 한 번 눈에 띄게 정리해서 보여주는 게 목적
-    (src/providers/notion_subscriptions.py의 get_unused_subscriptions).
+  - 매월 1일 "지난달 요약" 아래에 회사/개인 구독 월간 점검 섹션 (개발 세션 1, 기존
+    "🧟 3개월 이상 미이용 추정 구독" 하이라이트를 대체): Notion "신용카드"가 법인카드인
+    구독은 "💼 회사 월 고정비 · 월간 점검"(월 환산 원화 합계 + 이용 미확인 표시)으로,
+    나머지는 "🎬 개인 구독(참고)"로 나눠 보여준다. 원화 환산 환율은 budget.json의 usd_krw.
 """
 
+import argparse
 import os
 import sys
 import traceback
@@ -60,6 +64,7 @@ import reply_processor  # noqa: E402
 from providers import anthropic_cost, openai_cost, notion_subscriptions  # noqa: E402
 
 KST = ZoneInfo("Asia/Seoul")
+COMPANY_CARD = "법인카드"  # Notion "신용카드" 값 중 회사 월 고정비로 분류할 값
 
 
 def _load_dotenv_if_present() -> None:
@@ -265,9 +270,9 @@ def _build_weekly_section_safe(today) -> str | None:
         return f"⚠️ 지난주 요약 생성 실패: {e}"
 
 
-def _build_monthly_section_safe(today) -> str | None:
-    """오늘이 매월 1일이 아니면 None(섹션 생략)."""
-    if not weekly_monthly.is_first_of_month(today):
+def _build_monthly_section_safe(today, force: bool = False) -> str | None:
+    """오늘이 매월 1일이 아니면 None(섹션 생략). force면 날짜와 무관하게 생성(테스트용)."""
+    if not (weekly_monthly.is_first_of_month(today) or force):
         return None
     try:
         start, end = weekly_monthly.last_month_range(today)
@@ -277,39 +282,100 @@ def _build_monthly_section_safe(today) -> str | None:
         return f"⚠️ 지난달 요약 생성 실패: {e}"
 
 
-def _build_unused_subscription_highlight_safe(today) -> str | None:
-    """
-    [2단계 세션 3(선택)] 매월 1일 "지난달 요약" 바로 아래에 "3개월 이상 미이용 추정"
-    구독을 하이라이트한다. 좀비 구독(안 쓰는데 계속 결제)을 D-3 알림만으로는 놓치기
-    쉬워서(버튼을 안 누르고 넘어가면 그냥 다음 달로 넘어감) 한 달에 한 번 눈에 띄게
-    모아서 보여주는 게 목적 — src/providers/notion_subscriptions.get_unused_subscriptions()
-    참고(판단 기준: 마지막 이용일 또는 결제 시작일로부터 3개월 경과).
+def _format_usd_compact(amount: float) -> str:
+    """$100.00 -> $100, $19.99 -> $19.99 (월간 점검 줄을 짧게 유지하기 위함)."""
+    return f"${amount:,.0f}" if float(amount).is_integer() else f"${amount:,.2f}"
 
-    다른 섹션들과 동일한 방어 패턴: Notion 미설정이면 조용히 생략(이미 구독 섹션에서
-    경고가 뜨므로 중복 표시 안 함), 대상이 없으면 생략, 예상 못 한 에러만 경고로 표시.
-    """
-    if not weekly_monthly.is_first_of_month(today):
-        return None
-    try:
-        unused = notion_subscriptions.get_unused_subscriptions(3)
-    except notion_subscriptions.NotionConfigError:
-        return None
-    except Exception as e:
-        return f"⚠️ 미이용 구독 하이라이트 생성 실패: {e}"
 
-    if not unused:
-        return None
+def _format_original_price(s: dict) -> str:
+    """월 환산 금액 옆 괄호에 붙일 원래 결제 금액. 원화 월 결제는 환산값과 같으므로 생략."""
+    cycle = s.get("cycle") or "월"
+    if s["currency"] == "USD":
+        return f" ({_format_usd_compact(s['amount'])}/{cycle})"
+    if cycle == "연":
+        return f" ({format_currency(s['amount'], 'KRW')}/연)"
+    return ""
 
-    lines = ["🧟 3개월 이상 미이용 추정 구독"]
-    for s in unused:
-        amt = format_currency(s["amount"], s["currency"])
-        if s["unused_reason"] == "last_used":
-            detail = f"마지막 이용 {s['reference_date']}"
-        else:
-            detail = f"이용 확인 이력 없음, 구독 시작 {s['reference_date']}"
-        lines.append(f"· {s['name']} {amt} — {s['months_since']}개월째 ({detail})")
-    lines.append("(해지를 고려해보세요 — Notion에서 상태를 '구독 해지'로 바꾸면 다음부터 제외돼요)")
+
+def _build_company_subscription_section(subs: list[dict], today, usd_krw: float) -> str:
+    """[개발 세션 1] 섹션 A — 신용카드 == 법인카드. 유지/해지 판단용으로 월 환산 금액
+    내림차순 + 마지막 이용일 + 이용 미확인 표시."""
+    company = [(notion_subscriptions.monthly_krw(s, usd_krw), s) for s in subs if s["card"] == COMPANY_CARD]
+    company.sort(key=lambda x: x[0], reverse=True)
+    total = sum(krw for krw, _ in company)
+
+    lines = [
+        "💼 회사 월 고정비 · 월간 점검",
+        f"월 합계 {format_currency(total, 'KRW')} ({len(company)}건)",
+    ]
+    if not company:
+        lines.append("· 법인카드 구독 없음")
+    for krw, s in company:
+        last_used = s["last_used_date"]
+        used_text = f"마지막 이용 {last_used.month}/{last_used.day}" if last_used else "마지막 이용 기록 없음"
+        warn = " ⚠️ 이용 미확인" if notion_subscriptions.is_usage_unconfirmed(s, today, 3) else ""
+        lines.append(
+            f"· {s['name']} {format_currency(krw, 'KRW')}{_format_original_price(s)} — {used_text}{warn}"
+        )
+    lines.append("(안 쓰는 건 Notion에서 상태를 '구독 해지'로 바꾸세요)")
     return "\n".join(lines)
+
+
+def _build_personal_subscription_section(subs: list[dict], usd_krw: float) -> str:
+    """[개발 세션 1] 섹션 B — 법인카드가 아닌 구독(참고용, 점검 표시 없음).
+    신용카드가 비어 있는 구독은 회사/개인 어느 합계에도 넣지 않고 "❓ 카드 미지정"으로 따로 표시."""
+    personal = [
+        (notion_subscriptions.monthly_krw(s, usd_krw), s)
+        for s in subs
+        if s["card"] and s["card"] != COMPANY_CARD
+    ]
+    personal.sort(key=lambda x: x[0], reverse=True)
+    total = sum(krw for krw, _ in personal)
+
+    lines = [
+        "🎬 개인 구독(참고)",
+        f"월 합계 {format_currency(total, 'KRW')} ({len(personal)}건)",
+    ]
+    for krw, s in personal:
+        lines.append(f"· {s['name']} {format_currency(krw, 'KRW')}")
+
+    unassigned = [s["name"] for s in subs if not s["card"]]
+    if unassigned:
+        lines.append("")
+        lines.append(f"❓ 카드 미지정: {', '.join(unassigned)} (Notion에서 신용카드를 입력하세요)")
+    return "\n".join(lines)
+
+
+def _build_subscription_review_sections_safe(today, force: bool = False) -> list[str]:
+    """
+    [개발 세션 1] 매월 1일(또는 force) "지난달 요약" 아래에 회사/개인 구독 섹션을 붙인다.
+    기존 "🧟 3개월 이상 미이용 추정 구독" 하이라이트를 대체 — 회사 방침상 AI·개발 구독은
+    법인카드로 결제하므로, 회사 월 고정비를 정확히 보고 유지/해지를 판단하는 게 목적.
+
+    Notion 조회는 한 번만 하고 두 섹션이 결과를 공유한다(API 호출 최소화).
+    다른 섹션들과 동일한 방어 패턴: Notion 미설정이면 조용히 생략(이미 구독 섹션에서
+    경고가 뜨므로 중복 표시 안 함), 섹션별로 실패하면 그 섹션만 경고 한 줄로 대체.
+    """
+    if not (weekly_monthly.is_first_of_month(today) or force):
+        return []
+    try:
+        subs = notion_subscriptions.fetch_active_subscriptions()
+    except notion_subscriptions.NotionConfigError:
+        return []
+    except Exception as e:
+        return [f"⚠️ 구독 월간 점검 생성 실패: {e}"]
+
+    usd_krw = budget.load_usd_krw()
+    sections = []
+    try:
+        sections.append(_build_company_subscription_section(subs, today, usd_krw))
+    except Exception as e:
+        sections.append(f"⚠️ 회사 월 고정비 섹션 생성 실패: {e}")
+    try:
+        sections.append(_build_personal_subscription_section(subs, usd_krw))
+    except Exception as e:
+        sections.append(f"⚠️ 개인 구독 섹션 생성 실패: {e}")
+    return sections
 
 
 def _fetch_provider_kst_precise_cost(provider_module, config_error_cls, kst_date):
@@ -366,8 +432,13 @@ def _build_kst_precise_section_safe(today) -> str | None:
         return f"⚠️ KST 정밀 비용(실험적) 계산 실패: {e}"
 
 
-def build_report() -> tuple[str, list]:
+def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[str, list]:
     """
+    Args:
+        dry_run: True면 지난 D-3 버튼 응답 처리(텔레그램 getUpdates/확정 + Notion 기록)를
+            건너뛴다 — 로컬 확인만으로 실제 응답이 소비되지 않게 하기 위함.
+        force_monthly: True면 1일이 아니어도 월간 섹션(지난달 요약 + 회사/개인 구독) 생성.
+
     Returns:
         (리포트 본문 텍스트, 인라인 키보드 행 리스트) 튜플. 키보드가 빈 리스트면
         일반 텍스트 메시지로, 아니면(D-3 알림 대상이 있으면) 버튼이 달린 메시지로
@@ -385,7 +456,7 @@ def build_report() -> tuple[str, list]:
     sections = [header]
 
     # [2단계 세션 2] 지난 D-3 알림 응답 처리 결과 — 있으면 맨 위(헤더 바로 다음)에 표시
-    reply_text = _build_reply_processing_section_safe()
+    reply_text = None if dry_run else _build_reply_processing_section_safe()
     if reply_text:
         sections.append(reply_text)
 
@@ -410,21 +481,27 @@ def build_report() -> tuple[str, list]:
     if weekly_text:
         sections.append(weekly_text)
 
-    monthly_text = _build_monthly_section_safe(today)
+    monthly_text = _build_monthly_section_safe(today, force_monthly)
     if monthly_text:
         sections.append(monthly_text)
 
-    unused_text = _build_unused_subscription_highlight_safe(today)
-    if unused_text:
-        sections.append(unused_text)
+    sections.extend(_build_subscription_review_sections_safe(today, force_monthly))
 
     return "\n\n".join(sections), keyboard
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="CostPing 일일 리포트")
+    parser.add_argument("--dry-run", action="store_true", help="텔레그램 발송 없이 콘솔 출력만")
+    args = parser.parse_args()
+
     _load_dotenv_if_present()
+    force_monthly = os.environ.get("COSTPING_FORCE_MONTHLY") == "1"
     try:
-        message, keyboard = build_report()
+        message, keyboard = build_report(dry_run=args.dry_run, force_monthly=force_monthly)
+        if args.dry_run:
+            print(f"[dry-run] 발송 생략 (버튼 {len(keyboard)}행)\n" + message)
+            return
         if keyboard:
             telegram.send_message_with_keyboard(message, keyboard)
         else:

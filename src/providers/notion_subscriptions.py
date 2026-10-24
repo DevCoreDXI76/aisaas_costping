@@ -1,6 +1,6 @@
 """
 Notion "구독 중" 데이터소스 연동 (2단계 세션 3 — 세션 1: 읽기 전용 전환 / 세션 2: D-3 알림
-+ 원탭 버튼 + "마지막 이용일" 기록 / 세션 3(선택): N개월 이상 미이용 하이라이트).
++ 원탭 버튼 + "마지막 이용일" 기록 / 개발 세션 1: 신용카드·유형 읽기 + 월 환산 원화 헬퍼).
 
 기존에는 subscriptions.json을 수동으로 관리했는데, 실제로 쓰고 있는 Notion
 구독 관리 DB랑 내용이 어긋나는 문제가 있었다(예: JSON에는 "Claude MAX" $100로
@@ -10,6 +10,8 @@ Notion "구독 중" 데이터소스 연동 (2단계 세션 3 — 세션 1: 읽�
 Notion 쪽 "구독 중" 데이터소스 스키마(사람이 직접 채우는 필드만 표시):
   이름            (title)
   유형            (select: OTT, AI Agent, Productivity, ... )
+  신용카드         (select: "법인카드" / "롯데카드" / "KB카드" / "카카오페이" — 법인카드면
+                   회사 월 고정비로 분류, 매월 1일 리포트의 회사/개인 구독 섹션 참고)
   상태            (select: "구독 중" / "구독 해지")
   결제 시작일      (date)
   결제 주기        (select: "월" / "연")
@@ -185,7 +187,24 @@ def _parse_subscription_page(page: dict, today: date) -> dict | None:
         "next_payment_date": next_payment,
         "memo": _get_rich_text(props.get("비고")),
         "last_used_date": last_used,
+        "card": _get_select(props.get("신용카드")),
+        "category": _get_select(props.get("유형")),
+        "cycle": cycle,
     }
+
+
+def monthly_krw(sub: dict, usd_krw: float) -> int:
+    """구독 1건의 월 환산 원화 금액. USD면 × usd_krw, 연 결제면 ÷ 12, 정수 원 단위 반올림."""
+    amount = sub["amount"] * usd_krw if sub["currency"] == "USD" else sub["amount"]
+    if sub.get("cycle") == "연":
+        amount /= 12
+    return int(round(amount))
+
+
+def is_usage_unconfirmed(sub: dict, today: date, months: int = 3) -> bool:
+    """마지막 이용일이 없거나 months개월 이상 지났으면 True (월간 점검의 "⚠️ 이용 미확인")."""
+    last_used = sub.get("last_used_date")
+    return last_used is None or _months_between(last_used, today) >= months
 
 
 def fetch_active_subscriptions(
@@ -194,7 +213,8 @@ def fetch_active_subscriptions(
     """
     Notion "구독 중" 데이터베이스에서 상태 = active_status_value인 행을 전부 읽어와
     [{"page_id", "name", "amount", "currency", "start_date"(date 객체), "next_payment_date"
-    (date 객체), "memo", "last_used_date"(date 객체 또는 None)}, ...] 로 반환한다.
+    (date 객체), "memo", "last_used_date"(date 객체 또는 None), "card", "category",
+    "cycle"("월"/"연") — card/category는 비어 있으면 None}, ...] 로 반환한다.
     """
     api_key = api_key or _get_api_key()
     config = config or load_config()
@@ -258,53 +278,6 @@ def get_due_in_days(
     return [s for s in subs if s["next_payment_date"] == target]
 
 
-def get_unused_subscriptions(
-    months: int = 3, api_key: str | None = None, config: dict | None = None
-) -> list[dict]:
-    """[2단계 세션 3(선택)] 월간 리포트용 "N개월 이상 미이용" 하이라이트 대상을 반환한다.
-
-    "마지막 이용일"은 D-3 알림에서 "✅ 씀"을 눌러야만 채워지고 "❌ 안 씀"은 갱신하지
-    않는다(update_last_used_date 참고) — 그래서 이 필드가 비어 있는 것 자체가 "한 번도
-    이용을 확인 못 함"이라는 신호가 된다. 다만 이 필드는 2026-07-28에 막 추가돼서,
-    구독을 시작한 지 얼마 안 됐거나 아직 D-3 알림이 한 번도 안 온 구독까지 무작정
-    "미이용"으로 몰면 오탐이 된다. 그래서 두 경우를 나눠서 판단한다:
-      1) last_used_date가 있으면: 그 날짜로부터 months개월 이상 지났는지로 판단.
-      2) last_used_date가 없으면: 결제 시작일(start_date)로부터 months개월 이상 지났는데도
-         (=D-3 알림을 최소 한 번은 받았을 만한 기간인데도) 한 번도 "✅ 씀"이 안 눌렸는지로
-         판단. 시작한 지 얼마 안 된 구독은 제외된다.
-
-    반환값의 각 항목은 기존 dict에 "unused_reason"("last_used"|"never_confirmed")과
-    "reference_date"(판단 기준이 된 날짜), "months_since"(그 날짜로부터 지난 만 개월 수)를
-    덧붙인 것이다. next_payment_date 오름차순이 아니라 months_since 내림차순(가장 오래
-    안 쓴 것부터)으로 정렬해서 반환한다.
-    """
-    subs = fetch_active_subscriptions(api_key, config)
-    today = datetime.now(KST).date()
-
-    unused: list[dict] = []
-    for s in subs:
-        if s["last_used_date"] is not None:
-            reference_date = s["last_used_date"]
-            reason = "last_used"
-        else:
-            reference_date = s["start_date"]
-            reason = "never_confirmed"
-
-        months_since = _months_between(reference_date, today)
-        if months_since >= months:
-            unused.append(
-                {
-                    **s,
-                    "unused_reason": reason,
-                    "reference_date": reference_date,
-                    "months_since": months_since,
-                }
-            )
-
-    unused.sort(key=lambda x: x["months_since"], reverse=True)
-    return unused
-
-
 def update_last_used_date(
     page_id: str,
     used_date: date,
@@ -353,9 +326,3 @@ if __name__ == "__main__":
     due_today, due_tomorrow = get_due_today_and_tomorrow()
     print(f"\n오늘 결제: {[s['name'] for s in due_today] or '없음'}")
     print(f"내일 결제: {[s['name'] for s in due_tomorrow] or '없음'}")
-
-    unused = get_unused_subscriptions(3)
-    print(f"\n3개월 이상 미이용 추정 {len(unused)}건:")
-    for s in unused:
-        reason = "마지막 이용일" if s["unused_reason"] == "last_used" else "이용 확인 이력 없음(시작일 기준)"
-        print(f"  {s['name']:<16} {s['months_since']}개월째 ({reason}: {s['reference_date']})")

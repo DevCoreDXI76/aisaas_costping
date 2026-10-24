@@ -20,7 +20,7 @@ GitHub Actions (cron, 매일 23:00 UTC = 08:00 KST)
        ├─ src/providers/notion_subscriptions.py + notion_config.json
        │                                     → Notion "구독 중" DB에서 오늘·내일·D-3 결제 예정 구독 조회
        │                                        + "마지막 이용일" 필드 기록(get_due_in_days/update_last_used_date)
-       │                                        + 3개월 이상 미이용 추정(get_unused_subscriptions, 매월 1일)
+       │                                        + 신용카드·유형 읽기, 월 환산 원화(monthly_krw, 매월 1일 회사/개인 구독 섹션)
        ├─ src/reply_processor.py           → 텔레그램 인라인 버튼(✅/❌) 응답 회수 → Notion 반영
        └─ src/telegram.py                  → 리포트 발송(+인라인 버튼) + getUpdates 폴링 + 에러 알림
 ```
@@ -169,21 +169,19 @@ python src/providers/notion_subscriptions.py
 - 로컬에서 직접 확인하려면: `python src/report.py`로 알림을 받고 버튼을 누른 뒤, 다시
   `python src/report.py`를 한 번 더 실행하면 "📋 지난 답변 처리" 섹션에 결과가 뜹니다.
 
-### 3개월 이상 미이용 구독 하이라이트
+### 매월 1일 회사/개인 구독 섹션
 
-매월 1일 "🗓️ 지난달 요약" 바로 다음에 "🧟 3개월 이상 미이용 추정 구독" 섹션이 추가로
-표시됩니다. D-3 알림에 응답을 안 하고 그냥 넘어가면 놓치기 쉬운 좀비 구독을, 한 달에 한 번
-눈에 띄게 모아 보여주는 게 목적입니다.
+매월 1일 "🗓️ 지난달 요약" 바로 다음에 Notion `신용카드` 값으로 구독을 나눠 보여줍니다
+(회사 방침: AI·개발 구독은 법인카드, OTT 등은 개인 카드).
 
-- 판단 기준: `마지막 이용일`이 있으면 그 날짜로부터, 없으면 `결제 시작일`로부터 3개월 이상
-  지났는지로 판단합니다. 구독을 시작한 지 3개월이 안 됐으면(아직 D-3 알림을 못 받았을 수
-  있으므로) "판단할 데이터 없음"으로 보고 제외됩니다.
-- 대상 구독이 없으면 이 섹션 자체가 생략됩니다.
-- 임계값(현재 3개월 고정)을 바꾸고 싶으면 `src/report.py`의
-  `_build_unused_subscription_highlight_safe()`에서 호출하는
-  `notion_subscriptions.get_unused_subscriptions(3)`의 인자를 수정하세요.
-- 이 필드(`마지막 이용일`)는 2026-07-28에 막 추가돼서, 기존 구독은 D-3 알림에 한 번 이상
-  응답이 쌓이기 전까지는 "결제 시작일" 기준으로만 판단됩니다.
+- **💼 회사 월 고정비 · 월간 점검** (`신용카드` = 법인카드): 월 환산 원화 합계 + 건수, 항목은 월 환산
+  금액 내림차순. `마지막 이용일`이 없거나 3개월 이상 지났으면 "⚠️ 이용 미확인"이 붙습니다.
+- **🎬 개인 구독(참고)** (법인카드 외): 월 합계 + 건수, 이름·금액만.
+- `신용카드`가 비어 있는 구독은 어느 합계에도 넣지 않고 "❓ 카드 미지정"으로 따로 표시됩니다.
+- 월 환산: USD는 `budget.json`의 `usd_krw`(고정 환율, 분기마다 갱신, 없으면 1400)를 곱하고, 연 결제는
+  12로 나눈 뒤 원 단위 반올림합니다.
+- 1일이 아니어도 확인하려면: 로컬은 `COSTPING_FORCE_MONTHLY=1 python src/report.py --dry-run`
+  (텔레그램 발송·지난 버튼 응답 처리 없이 콘솔 출력만), Actions는 수동 실행 시 `force_monthly`를 체크.
 
 ## 예산 경고 설정 방법
 
@@ -192,9 +190,10 @@ python src/providers/notion_subscriptions.py
 
 ```json
 {
-  "daily_budget_usd": 5,
-  "monthly_budget_usd": 60,
-  "warning_threshold_pct": 80
+  "daily_budget_usd": 1,
+  "monthly_budget_usd": 15,
+  "warning_threshold_pct": 80,
+  "usd_krw": 1400
 }
 ```
 

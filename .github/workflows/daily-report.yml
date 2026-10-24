@@ -4,17 +4,22 @@ on:
   schedule:
     # UTC 23:00 = KST 다음날 08:00
     - cron: "0 23 * * *"
-  workflow_dispatch: {}  # Actions 탭에서 수동 실행(테스트)용
+  workflow_dispatch:  # Actions 탭에서 수동 실행(테스트)용
+    inputs:
+      force_monthly:
+        description: "1일이 아니어도 월간 섹션(지난달 요약 + 회사/개인 구독) 생성"
+        type: boolean
+        default: false
 
 jobs:
   report:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -28,4 +33,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          # schedule 실행에는 inputs가 없어 빈 값 → 월간 섹션은 1일에만 표시
+          COSTPING_FORCE_MONTHLY: ${{ inputs.force_monthly && '1' || '' }}
         run: python src/report.py
