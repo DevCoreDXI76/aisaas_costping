@@ -795,6 +795,12 @@ def build_report(
 
 
 def main() -> None:
+    # Windows 기본 콘솔(cp949)에서 이모지 print가 UnicodeEncodeError로 죽지 않게 한다.
+    # 리눅스(Actions)는 원래 UTF-8이라 동작 변화 없음, 텔레그램 발송 본문과도 무관.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="CostPing 일일 리포트")
     parser.add_argument("--dry-run", action="store_true", help="텔레그램 발송 없이 콘솔 출력만")
     args = parser.parse_args()
@@ -821,6 +827,8 @@ def main() -> None:
         # 조용히 죽지 않기: 무슨 일이 있어도 에러를 텔레그램으로도 알린다
         err_text = traceback.format_exc()
         print(err_text, file=sys.stderr)
+        if args.dry_run:
+            sys.exit(1)  # dry-run은 로컬 확인용이라 오류도 콘솔에만 출력
         try:
             telegram.send_message(f"⚠️ CostPing 실행 중 오류 발생\n```\n{err_text[-500:]}\n```")
         except Exception:
