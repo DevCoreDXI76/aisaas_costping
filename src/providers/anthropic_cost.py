@@ -242,6 +242,43 @@ def _get_paginated(path: str, params: dict, api_key: str) -> list[dict]:
             return all_data
 
 
+def _period_index(day: date, periods: list[tuple[date, date]]) -> int | None:
+    """day가 속한 [start, end) 구간의 인덱스. 어느 구간에도 없으면 None."""
+    for i, (start, end) in enumerate(periods):
+        if start <= day < end:
+            return i
+    return None
+
+
+def _bucket_date(bucket: dict) -> date:
+    return date.fromisoformat(bucket["starting_at"][:10])
+
+
+def get_cost_for_periods(periods: list[tuple[date, date]], api_key: str | None = None) -> list[float]:
+    """
+    여러 [start, end) (UTC 날짜) 구간의 cost_report 합계를 cost_report 조회 한 번(페이지네이션
+    포함)으로 구한다. 주간/월간 요약에서 "이번 기간 + 지난 기간"을 같이 받아 날짜로 나누는 용도 —
+    get_cost_for_range를 두 번 부르는 것보다 호출이 적다. limit=31은 1d 버킷 상한.
+    """
+    api_key = api_key or _get_api_key()
+    buckets = _get_paginated(
+        "/v1/organizations/cost_report",
+        {
+            "starting_at": _iso_z(min(s for s, _ in periods)),
+            "ending_at": _iso_z(max(e for _, e in periods)),
+            "bucket_width": "1d",
+            "limit": 31,
+        },
+        api_key,
+    )
+    totals = [0.0] * len(periods)
+    for b in buckets:
+        i = _period_index(_bucket_date(b), periods)
+        if i is not None:
+            totals[i] += _sum_amount_usd([b])
+    return totals
+
+
 def fetch_api_key_names(api_key: str | None = None) -> dict[str, str]:
     """{api_key_id: 키 이름}. 보관(archived)된 키도 포함한다 — 지난 사용량이 남아 있을 수 있어서."""
     api_key = api_key or _get_api_key()
@@ -312,12 +349,20 @@ def _aggregate_by_project(buckets: list[dict], key_names: dict[str, str], mappin
     return sorted(rows.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
+_key_names_cache: dict[str, str] | None = None
+
+
 def _fetch_key_names_safe(api_key: str) -> dict[str, str]:
-    """키 목록 조회가 실패해도 비용 집계는 계속한다(이 경우 키 ID가 그대로 표시됨)."""
-    try:
-        return fetch_api_key_names(api_key)
-    except Exception:
-        return {}
+    """키 목록은 실행(프로세스) 1회당 한 번만 조회해 일일/주간/월간 섹션이 같이 쓴다.
+    조회가 실패해도 비용 집계는 계속하며, 실패 결과(빈 매핑)도 캐시해 이번 실행 동안에는
+    키 ID가 그대로 표시된다(실패한 조회를 섹션마다 반복하지 않기 위함)."""
+    global _key_names_cache
+    if _key_names_cache is None:
+        try:
+            _key_names_cache = fetch_api_key_names(api_key)
+        except Exception:
+            _key_names_cache = {}
+    return _key_names_cache
 
 
 def get_cost_by_project(
@@ -330,6 +375,25 @@ def get_cost_by_project(
     return _aggregate_by_project(
         buckets, _fetch_key_names_safe(api_key), project_map.load_project_map(), pricing.load_prices()
     )
+
+
+def get_cost_by_project_for_periods(
+    periods: list[tuple[date, date]], api_key: str | None = None
+) -> list[list[dict]]:
+    """여러 [start, end) (UTC 날짜) 구간의 프로젝트별 추정 비용을 usage 조회 한 번(페이지네이션
+    포함)으로 구해 구간별 리스트로 돌려준다. 주간/월간 요약의 "이번 기간 vs 지난 기간" 비교용."""
+    api_key = api_key or _get_api_key()
+    buckets = fetch_usage_by_key_daily(min(s for s, _ in periods), max(e for _, e in periods), api_key)
+    key_names = _fetch_key_names_safe(api_key)
+    mapping = project_map.load_project_map()
+    prices = pricing.load_prices()
+
+    per_period: list[list[dict]] = [[] for _ in periods]
+    for b in buckets:
+        i = _period_index(_bucket_date(b), periods)
+        if i is not None:
+            per_period[i].append(b)
+    return [_aggregate_by_project(bs, key_names, mapping, prices) for bs in per_period]
 
 
 def get_yesterday_and_month_to_date_cost_by_project(

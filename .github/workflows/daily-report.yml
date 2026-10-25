@@ -10,6 +10,10 @@ on:
         description: "1일이 아니어도 월간 섹션(지난달 요약 + 회사/개인 구독) 생성"
         type: boolean
         default: false
+      force_weekly:
+        description: "월요일이 아니어도 주간 섹션(지난주 요약 + 전주 대비) 생성"
+        type: boolean
+        default: false
 
 jobs:
   report:
@@ -33,6 +37,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-          # schedule 실행에는 inputs가 없어 빈 값 → 월간 섹션은 1일에만 표시
+          # schedule 실행에는 inputs가 없어 빈 값 → 월간 섹션은 1일에만, 주간 섹션은 월요일에만 표시
           COSTPING_FORCE_MONTHLY: ${{ inputs.force_monthly && '1' || '' }}
+          COSTPING_FORCE_WEEKLY: ${{ inputs.force_weekly && '1' || '' }}
         run: python src/report.py

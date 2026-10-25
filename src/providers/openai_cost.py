@@ -282,16 +282,65 @@ def _aggregate_by_project(buckets: list[dict], project_names: dict[str, str], ma
     return sorted(rows.values(), key=lambda x: x["cost_usd"], reverse=True)
 
 
+_project_names_cache: dict[str, str] | None = None
+
+
 def _fetch_project_names_safe(api_key: str) -> dict[str, str]:
-    """프로젝트 목록 조회가 실패해도 비용 집계는 계속한다(이 경우 프로젝트 ID가 그대로 표시됨)."""
-    try:
-        return fetch_project_names(api_key)
-    except Exception:
-        return {}
+    """프로젝트 목록은 실행(프로세스) 1회당 한 번만 조회해 일일/주간/월간 섹션이 같이 쓴다.
+    조회가 실패해도 비용 집계는 계속하며, 실패 결과(빈 매핑)도 캐시해 이번 실행 동안에는
+    프로젝트 ID가 그대로 표시된다."""
+    global _project_names_cache
+    if _project_names_cache is None:
+        try:
+            _project_names_cache = fetch_project_names(api_key)
+        except Exception:
+            _project_names_cache = {}
+    return _project_names_cache
 
 
 def _utc_ts(d: date) -> int:
     return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
+
+
+def _period_index(bucket: dict, periods: list[tuple[date, date]]) -> int | None:
+    """버킷(start_time, UTC 자정 timestamp)이 속한 [start, end) 구간의 인덱스. 없으면 None."""
+    ts = bucket.get("start_time")
+    for i, (start, end) in enumerate(periods):
+        if ts is not None and _utc_ts(start) <= ts < _utc_ts(end):
+            return i
+    return None
+
+
+def get_cost_for_periods(periods: list[tuple[date, date]], api_key: str | None = None) -> list[float]:
+    """여러 [start, end) (UTC 날짜) 구간의 Costs 합계를 조회 한 번으로 구한다(주간/월간 비교용)."""
+    data = fetch_cost_report(
+        _utc_ts(min(s for s, _ in periods)), _utc_ts(max(e for _, e in periods)), api_key
+    )
+    totals = [0.0] * len(periods)
+    for b in data:
+        i = _period_index(b, periods)
+        if i is not None:
+            totals[i] += _sum_amount_usd([b])
+    return totals
+
+
+def get_cost_by_project_for_periods(
+    periods: list[tuple[date, date]], api_key: str | None = None
+) -> list[list[dict]]:
+    """여러 [start, end) (UTC 날짜) 구간의 프로젝트별 비용을 조회 한 번으로 구해 구간별로 돌려준다."""
+    api_key = api_key or _get_api_key()
+    buckets = fetch_costs_by_project_daily(
+        _utc_ts(min(s for s, _ in periods)), _utc_ts(max(e for _, e in periods)), api_key
+    )
+    project_names = _fetch_project_names_safe(api_key)
+    mapping = project_map.load_project_map()
+
+    per_period: list[list[dict]] = [[] for _ in periods]
+    for b in buckets:
+        i = _period_index(b, periods)
+        if i is not None:
+            per_period[i].append(b)
+    return [_aggregate_by_project(bs, project_names, mapping) for bs in per_period]
 
 
 def get_cost_by_project(

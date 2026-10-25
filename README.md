@@ -9,10 +9,13 @@ AI API 비용 + 구독 결제일을 매일 아침 8시(KST) 텔레그램으로 �
 GitHub Actions (cron, 매일 23:00 UTC = 08:00 KST)
   └─ src/report.py
        ├─ src/providers/anthropic_cost.py  → 어제/이달/기간별 Anthropic 비용 (UTC 기준)
+       │    ├─ get_*_by_project*            → 키(프로젝트)별 추정 비용 (Usage API+단가표)
        │    └─ get_kst_precise_cost_for_day → KST 정밀 비용(실험적, Usage API+단가표)
        ├─ src/providers/openai_cost.py     → 어제/이달/기간별 OpenAI 비용 (UTC 기준)
+       │    ├─ get_*_by_project*            → 프로젝트별 비용 (Costs API group_by)
        │    └─ get_kst_precise_cost_for_day → KST 정밀 비용(실험적, Usage API+단가표)
-       ├─ src/pricing.py + prices.json     → KST 정밀 비용 계산용 간소화판 단가표
+       ├─ src/project_map.py + projects.json → 키/프로젝트 → 리포트 표시명 매핑
+       ├─ src/pricing.py + prices.json     → 프로젝트별·KST 정밀 비용 계산용 간소화판 단가표
        ├─ src/kst_bucket.py                → KST 캘린더 날짜 ↔ UTC 시간 변환
        ├─ src/budget.py + budget.json      → 월 예산 초과 경고
        ├─ src/weekly_monthly.py            → 매주 월요일 "지난주 요약",
@@ -45,14 +48,17 @@ aisaas_costping/
 │  ├─ budget.py             # 월 예산 초과 경고
 │  ├─ weekly_monthly.py     # 주간/월간 요약 날짜 범위 계산
 │  ├─ reply_processor.py    # D-3 알림 버튼 응답 회수 → Notion 반영
-│  ├─ pricing.py            # KST 정밀 비용 계산기(간소화판 단가표 기반) — 아래 참고
+│  ├─ pricing.py            # 토큰 → USD 계산기(간소화판 단가표 기반) — 아래 참고
+│  ├─ project_map.py        # projects.json 로더 (키/프로젝트 → 표시명)
 │  ├─ kst_bucket.py         # KST 캘린더 날짜 ↔ UTC 시간 변환
 │  └─ telegram.py           # 발송(+인라인 버튼) + getUpdates 폴링 + 에러 알림
 ├─ scripts/
-│  └─ explore_anthropic_usage.py  # Usage API 응답 확인용 1회성 탐색 스크립트(파이프라인 아님)
+│  ├─ explore_anthropic_usage.py  # Usage API 응답 확인용 1회성 탐색 스크립트(파이프라인 아님)
+│  └─ analyze_usage.py            # 30일 키별·모델별 비용 분해 1회성 진단(파이프라인 아님)
 ├─ notion_config.json       # Notion 구독 DB의 database_id 등 (비밀 아님, 커밋됨)
 ├─ budget.json              # 월 예산 한도 설정 (없으면 예산 경고 기능 자체가 생략됨)
-├─ prices.json              # 모델별 토큰 단가표 (간소화판, KST 정밀 비용 계산용)
+├─ projects.json            # API 키 이름/OpenAI 프로젝트 ID → 표시명 (비밀 아님, 커밋됨)
+├─ prices.json              # 모델별 토큰 단가표 (간소화판, 프로젝트별·KST 정밀 비용 계산용)
 ├─ requirements.txt
 ├─ PLAN.md                  # 세션별 개발 계획 + 2단계 백로그
 └─ README.md                # 이 문서
@@ -89,7 +95,8 @@ aisaas_costping/
 6. **notion_config.json 확인**: 데이터베이스가 다르면 `database_id`를 바꿔야 합니다. 아래
    "구독 관리 방법(Notion)" 참고.
 7. **budget.json 확인/수정**: 아래 "예산 경고 설정 방법" 참고. (선택 사항 — 안 써도 나머지 기능은 그대로 동작)
-8. 커밋/푸시하면 GitHub Actions가 매일 KST 08:00에 자동 실행됩니다. Actions 탭 →
+8. **projects.json 확인/수정**: 아래 "프로젝트별 비용" 참고. (선택 사항 — 없으면 키 이름이 그대로 표시됨)
+9. 커밋/푸시하면 GitHub Actions가 매일 KST 08:00에 자동 실행됩니다. Actions 탭 →
    "Daily Cost Report" → **Run workflow** 로 언제든 수동 테스트 가능합니다.
 
 ## 로컬에서 테스트하기
@@ -183,6 +190,47 @@ python src/providers/notion_subscriptions.py
 - 1일이 아니어도 확인하려면: 로컬은 `COSTPING_FORCE_MONTHLY=1 python src/report.py --dry-run`
   (텔레그램 발송·지난 버튼 응답 처리 없이 콘솔 출력만), Actions는 수동 실행 시 `force_monthly`를 체크.
 
+## 프로젝트별 비용
+
+일일 리포트의 합계 섹션 바로 아래에 어제 비용을 프로젝트(API 키)별로 나눠 보여줍니다. 시간 기준은
+위 "어제 API 비용 (UTC 기준)"과 같은 **UTC 하루**라서, 프로젝트별 금액 + 미귀속 = 위 합계가 됩니다.
+
+```
+🗂 프로젝트별 (어제, UTC)
+· MotionToon Studio (Anthropic) $0.38 — Sonnet 73% · Haiku 27% | 월 $4.51
+· 네이버 블로그 자동화 (Anthropic) $0.08 — Haiku 100% | 월 $0.65
+```
+
+- **Anthropic**: Usage API를 `api_key_id`·`model`별로 받아 `prices.json` 단가로 키별 비용을 추정하고,
+  실제 청구액(cost_report) 합계와 대조합니다. cost_report는 키별 구분을 지원하지 않아서(`group_by`는
+  `workspace_id`·`description`만 가능) 이 방식을 씁니다.
+- **OpenAI**: Costs API를 `project_id`별로 받습니다(실제 청구액이라 추정 없음).
+- 표시 규칙: 어제 비용 상위 5개 프로젝트 + 나머지는 "기타", $0.01 미만 줄(키 없이 쓴 Console 사용,
+  소액 OpenAI 프로젝트 등)은 숨김, 각 줄에 모델 계열 비중과 이번 달 누적.
+- **미귀속**: 청구 합계 - 프로젝트별 추정 합계. 단가표에 없는 모델·요금 항목(데이터 레지던시
+  +10%, 빠른 모드 등)이 여기 드러납니다. 음수면 "⚠️ 추정이 청구액보다 $x 많음 (prices.json 확인
+  필요)" — 단가표가 실제보다 비싸게 잡혀 있다는 뜻입니다.
+- 화면의 각 줄은 반올림 표시라 합이 위 합계와 1센트 정도 다르게 보일 수 있습니다(실제 값은 일치).
+- 조회가 실패하면 이 섹션만 "⚠️ 프로젝트별 비용 조회 실패: …"로 바뀌고 나머지 리포트는 정상 발송,
+  한 제공사만 실패하면 다른 제공사 줄은 그대로 표시됩니다.
+- 메시지가 3,800자(텔레그램 제한 4,096자)를 넘으면 일일·주간·월간 프로젝트 목록의 줄 수를 같이
+  줄입니다(넘친 프로젝트는 "기타"로 합쳐짐).
+
+### projects.json (표시명 매핑)
+
+```json
+{
+  "anthropic": { "motiontoon-studio-key": "MotionToon Studio", "naver-blog-actions": "네이버 블로그 자동화" },
+  "openai": { "proj_...": "표시명" }
+}
+```
+
+- `anthropic`: **키 이름**(Console에서 키 발급 시 붙인 이름) → 표시명. 시크릿(키 값)은 넣지 않습니다.
+  같은 프로젝트 키는 같은 이름으로 발급하면(재발급 포함) 자동으로 한 줄로 합쳐집니다.
+- `openai`: 프로젝트 ID → 표시명.
+- 매핑에 없는 키는 원래 키 이름(OpenAI는 프로젝트 이름)이 그대로 표시됩니다. 키 목록 조회가
+  실패하면 그 실행 동안에는 키 ID가 표시됩니다.
+
 ## 예산 경고 설정 방법
 
 `budget.json`에서 하루/이번 달 API 비용(Anthropic+OpenAI **종량제 사용 비용 합계만**, Notion에
@@ -208,12 +256,33 @@ python src/providers/notion_subscriptions.py
 
 별도 cron 추가 없이 기존 매일 08:00(KST) 실행에 조건부로 섹션이 더 붙습니다.
 
-- **매주 월요일**: "📅 지난주 요약" (지난주 월~일, Anthropic/OpenAI 비용)
-- **매월 1일**: "🗓️ 지난달 요약" (지난달 한 달 전체, Anthropic/OpenAI 비용)
+- **매주 월요일**: "📅 지난주 요약" (지난주 월~일, 그 전주 대비)
+- **매월 1일**: "🗓️ 지난달 요약" (지난달 한 달 전체, 그 전달 대비 — 월 일수 차이는 보정하지 않음)
+
+```
+📅 지난주 요약 (10/12~10/18)
+· Anthropic  $1.58
+· OpenAI     $0.00
+· 합계        $1.58 (전주 대비 ▼$0.09, -5%)
+프로젝트별 (전주 대비)
+· MotionToon Studio (Anthropic) $1.38 ▼$0.16 (-11%)
+· 네이버 블로그 자동화 (Anthropic) $0.20 ▲$0.08 (+60%)
+```
+
+- 증감: `▲/▼$금액 (±%)`. 지난 기간이 $0.10 미만이면 %는 빼고 금액만(소액 % 과장 방지), 지난 기간
+  $0이면 "(신규)", 변화가 $0.01 미만이면 표시 생략. 일부 제공사 조회 실패로 부분 합계일 때는 합계
+  줄의 증감만 생략(프로젝트 줄 증감은 유지).
+- 지난 기간 $0.01 이상이었는데 이번 기간 사용이 없으면 "$0.00 ▼$x (중단)" 줄로 사용 중인 프로젝트
+  아래에 표시합니다(상위 5줄 제한 안에 포함). 나머지 규칙(기타·미귀속·$0.01 미만 숨김)은 일일
+  프로젝트별 섹션과 같습니다.
+- 이번 기간과 지난 기간을 제공사별로 한 번에 조회해 날짜로 나눕니다(합계 cost_report 1회 +
+  프로젝트별 1회, 월간은 62일이라 Anthropic이 페이지 1개씩 더).
+- 월요일·1일이 아니어도 확인하려면: 로컬은 `COSTPING_FORCE_WEEKLY=1` / `COSTPING_FORCE_MONTHLY=1`을
+  붙여 `python src/report.py --dry-run`, Actions는 수동 실행 시 `force_weekly` / `force_monthly`를 체크.
 
 DB 없이 그날그날 Anthropic/OpenAI 비용 API에 해당 기간을 다시 질의하는 방식이라 별도 저장소가
 필요 없습니다(`src/weekly_monthly.py`가 날짜 범위 계산, `src/providers/*.py`의
-`get_cost_for_range()`가 조회).
+`get_cost_for_periods()`·`get_cost_by_project_for_periods()`가 조회).
 
 ## KST 정밀 비용 계산 (실험적)
 
@@ -226,12 +295,17 @@ API들만으로는 KST 자정에 정확히 맞출 방법이 없습니다(2단계
 매일 리포트에서 기존 "어제 API 비용 (UTC 기준)" 섹션 **바로 아래에 나란히** 뜹니다(대체 아님).
 
 다만 실제 단가 체계가 캐시 요율·컨텍스트 길이·배치 할인 등으로 복잡해서, **input/output/캐시 읽기
-+ 5분 캐시 쓰기만 반영한 간소화판**(`src/pricing.py`, `prices.json`)으로 범위를 좁혔습니다. 1시간
-캐시 쓰기·배치(batch) 처리·20만 토큰 초과 컨텍스트·오디오 토큰·웹 검색 도구 사용처럼 이 단가표가
-못 다루는 사용량을 만나면 그 부분은 계산에서 빼고(또는 근사치로 처리하고) ⚠️ 경고 문구를 리포트에
-같이 표시합니다 — 그래서 이 섹션의 숫자는 실제 청구액보다 살짝 낮거나(Anthropic 쪽 갭) 높게
-(OpenAI batch 감지 시) 나올 수 있습니다. `prices.json`의 가격은 수동으로 유지해야 하며, 특히 Claude
-Sonnet 5는 2026-09-01에 프로모션 요율이 끝나므로 그 이후엔 직접 갱신이 필요합니다.
++ 5분·1시간 캐시 쓰기 + Anthropic 웹 검색 도구 사용료까지 반영한 간소화판**(`src/pricing.py`,
+`prices.json`)으로 범위를 좁혔습니다. 배치(batch) 처리·20만 토큰 초과 컨텍스트·오디오 토큰·데이터
+레지던시처럼 이 단가표가 못 다루는 사용량을 만나면 그 부분은 계산에서 빼고(또는 근사치로 처리하고)
+⚠️ 경고 문구를 리포트에 같이 표시합니다 — 그래서 이 섹션의 숫자는 실제 청구액보다 살짝 낮거나
+(Anthropic 쪽 갭) 높게(OpenAI batch 감지 시) 나올 수 있습니다. 같은 단가표를 프로젝트별 비용
+섹션도 씁니다.
+
+`prices.json`의 가격은 수동으로 유지해야 합니다. 1시간 캐시 쓰기(기본 입력 단가 x2)와 웹 검색
+($10 / 1,000회) 단가는 2026-10-24 Anthropic 공식 가격 페이지
+(https://platform.claude.com/docs/en/about-claude/pricing)에서 확인했습니다. Claude Sonnet 5의
+$2/$10은 표준가로 확정됐습니다(9/1 인상 취소, `prices.json`의 `_readme` 참고).
 
 **아직 "실험적"으로 표시해둔 이유**: 새 계산 방식이 며칠 더 콘솔(platform.claude.com,
 platform.openai.com)의 실제 청구 금액과 비교되며 검증되기 전까지는, 기존 "어제 API 비용 (UTC
@@ -240,14 +314,15 @@ platform.openai.com)의 실제 청구 금액과 비교되며 검증되기 전까
 
 ## 알려진 이슈 / 주의사항
 
-- **시간 기준은 UTC**: "어제/이번 달/지난주/지난달"은 모두 UTC 자정 기준으로 계산합니다. KST
-  자정과는 최대 9시간 어긋나므로, 아침 8시(KST) 기준으로 보면 "그저께 낮~어제 낮(UTC로는 어제
-  하루)"의 비용이라고 보면 됩니다. 정밀화(KST 기준 일 경계)는 2단계 백로그입니다 (PLAN.md 참고).
+- **시간 기준은 UTC**: "어제/이번 달/지난주/지난달"과 프로젝트별 비용은 모두 UTC 자정 기준으로
+  계산합니다. KST 자정과는 최대 9시간 어긋나므로, 아침 8시(KST) 기준으로 보면 "그저께 낮~어제
+  낮(UTC로는 어제 하루)"의 비용이라고 보면 됩니다. KST 기준 하루는 "🧪 KST 정밀" 섹션(실험적)에서만
+  보여 주며, 두 기준을 통합할지는 백로그입니다 (PLAN.md 참고).
 - **OpenAI 비용 API의 `amount.value`**: 실제 응답에서 숫자/문자열이 섞여 오는 경우가 관측되어
   `float()`로 명시 변환하도록 처리했습니다 (`src/providers/openai_cost.py`).
 - **OpenAI 페이지네이션**: `group_by` 파라미터를 쓰면서 `limit`을 지정하지 않으면 `next_page` 토큰이
-  깨지는 버그가 커뮤니티에 보고된 적이 있어(2026년 3~4월), 이 프로젝트는 `group_by`를 쓰지 않고
-  `limit`을 항상 명시해 회피합니다.
+  깨지는 버그가 커뮤니티에 보고된 적이 있어(2026년 3~4월), 이 프로젝트는 Costs API를 부를 때
+  `limit`을 항상 명시합니다(프로젝트별 조회의 `group_by=project_id,line_item` 포함).
 - **텔레그램 발송은 기본 plain text**: 구독명/에러 메시지 등에 `_`, `*`, `` ` `` 같은 문자가 섞이면
   Markdown 파싱이 깨져 400 에러가 나기 때문에, 기본값을 plain text로 뒀습니다
   (`src/telegram.py`의 `send_message(text, parse_mode=None)`).
@@ -259,6 +334,8 @@ platform.openai.com)의 실제 청구 금액과 비교되며 검증되기 전까
 
 - Anthropic/OpenAI 중 한쪽 조회가 실패해도 나머지는 정상 표시되고, "부분 합계"로 표시됩니다.
   (일간/주간/월간/KST 정밀 섹션 모두 동일)
+- 프로젝트별 비용(일일 섹션, 주간·월간의 "프로젝트별" 블록)은 합계와 따로 방어합니다 — 프로젝트별
+  조회가 실패해도 그 부분만 "⚠️ … 프로젝트별 조회 실패: …"로 바뀌고 합계 줄은 그대로 나옵니다.
 - "🧪 KST 정밀 어제 비용 (실험적)" 섹션은 Anthropic·OpenAI 둘 다 조회에 실패하면 섹션 자체가
   조용히 생략됩니다(실험 기능 하나 때문에 핵심 리포트에 에러를 노출하지 않기 위함).
 - Notion 구독 조회가 실패해도(설정 미완료, 네트워크 오류, 필드명 불일치 등) 비용 섹션은 정상
@@ -277,7 +354,8 @@ platform.openai.com)의 실제 청구 금액과 비교되며 검증되기 전까
 ## 2단계 백로그
 
 - Next.js + Supabase 웹 대시보드, 구독 CRUD UI
-- KST 정밀 일 경계 (시간 단위 버킷 집계)
+- "🧪 KST 정밀" 섹션과 UTC 섹션 통합 여부 결정
+- 프로젝트별 비용 확장: 일일 스냅샷 커밋, `/stats` 즉시 조회, 자동 비용 절감 진단 규칙
 - Google Gemini API 비용 추가 (GCP BigQuery Billing Export 필요, MVP 아키텍처와 무게감이 다름)
 - Voyage AI 비용 추가 (MongoDB Atlas 산하, 공개 비용 API 없음 — 별도 문의 필요)
 - 기타 제공사 추가

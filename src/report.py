@@ -114,17 +114,6 @@ def _fetch_provider_cost(provider_module, config_error_cls):
         return 0.0, 0.0, f"조회 실패: {e}"
 
 
-def _fetch_provider_range_cost(provider_module, config_error_cls, start, end):
-    """제공사 기간별 비용 조회 헬퍼 (주간/월간 요약용). 성공하면 (cost_usd, None),
-    실패하면 (0, 경고문구)를 반환한다. _fetch_provider_cost와 동일한 방어 패턴."""
-    try:
-        return provider_module.get_cost_for_range(start, end), None
-    except config_error_cls as e:
-        return 0.0, f"건너뜀: {e}"
-    except Exception as e:
-        return 0.0, f"조회 실패: {e}"
-
-
 def build_cost_section() -> tuple[str, float | None, float | None, dict[str, float | None]]:
     """
     Anthropic + OpenAI 비용 섹션. 한쪽 API가 실패해도 나머지는 정상 표시되고,
@@ -221,6 +210,16 @@ def _format_model_shares(models: dict[str, float], total: float, top_n: int = 3)
     return " · ".join(parts[:top_n])
 
 
+def _format_unattributed_line(unattributed: float) -> str | None:
+    """미귀속(청구 합계 - 프로젝트별 추정 합계) 줄. ±$0.01 미만이면 None(숨김).
+    음수는 단가표가 실제보다 비싸게 잡혀 있다는 신호라 경고로 표시한다."""
+    if unattributed >= MIN_SHOWN_USD:
+        return f"· 미귀속 {format_currency(unattributed, 'USD')} (단가표 밖 사용분 등)"
+    if unattributed <= -MIN_SHOWN_USD:
+        return f"⚠️ 추정이 청구액보다 {format_currency(-unattributed, 'USD')} 많음 (prices.json 확인 필요)"
+    return None
+
+
 def build_project_section(
     project_costs: dict[str, dict],
     provider_yesterday: dict[str, float | None],
@@ -275,10 +274,9 @@ def build_project_section(
             f"· 기타 {len(rest)}개 {format_currency(rest_usd, 'USD')} | 월 {format_currency(rest_month, 'USD')}"
         )
 
-    if unattributed >= MIN_SHOWN_USD:
-        lines.append(f"· 미귀속 {format_currency(unattributed, 'USD')} (단가표 밖 사용분 등)")
-    elif unattributed <= -MIN_SHOWN_USD:
-        lines.append(f"⚠️ 추정이 청구액보다 {format_currency(-unattributed, 'USD')} 많음 (prices.json 확인 필요)")
+    unattributed_line = _format_unattributed_line(unattributed)
+    if unattributed_line:
+        lines.append(unattributed_line)
 
     if len(lines) == 1:
         lines.append("· 어제 사용 없음")
@@ -289,15 +287,16 @@ def build_project_section(
     return "\n".join(lines)
 
 
-def _build_project_section_safe(
-    project_costs: dict[str, dict], provider_yesterday: dict[str, float | None], max_rows: int
-) -> str | None:
-    """포맷 중 예상 못 한 에러가 나도 이 섹션만 경고로 바뀌고 리포트는 정상 발송된다
-    (조회 실패는 fetch_project_costs가 제공사별로 이미 흡수함)."""
-    try:
-        return build_project_section(project_costs, provider_yesterday, max_rows)
-    except Exception as e:
-        return f"⚠️ 프로젝트별 비용 조회 실패: {str(e)[:150]}"
+def _safe_builder(build, error_prefix: str):
+    """build(max_rows) -> 섹션 텍스트를 감싸, 포맷 중 예상 못 한 에러가 나도 그 섹션만
+    "error_prefix: 에러" 한 줄로 바뀌고 리포트는 정상 발송되게 한다. max_rows를 인자로 받는
+    이유는 메시지가 길 때 build_report가 조회 없이 줄 수만 줄여 다시 만들 수 있게 하기 위함."""
+    def builder(max_rows: int) -> str | None:
+        try:
+            return build(max_rows)
+        except Exception as e:
+            return f"{error_prefix}: {str(e)[:150]}"
+    return builder
 
 
 def _telegram_length(text: str) -> int:
@@ -369,55 +368,195 @@ def _build_d3_alert_section_and_keyboard() -> tuple[str | None, list]:
     return "\n".join(lines), keyboard
 
 
-def _build_range_summary_section(title_emoji: str, title: str, label: str, start, end) -> str:
-    a_cost, a_error = _fetch_provider_range_cost(
-        anthropic_cost, anthropic_cost.AnthropicConfigError, start, end
-    )
-    o_cost, o_error = _fetch_provider_range_cost(
-        openai_cost, openai_cost.OpenAIConfigError, start, end
-    )
+PROVIDER_LABELS = {"Anthropic": "Anthropic  ", "OpenAI": "OpenAI     "}  # 기존 섹션과 같은 정렬
+NEW_THRESHOLD_USD = 0.005  # 지난 기간이 이보다 작으면($0.00으로 표시되는 수준) "신규"
+PCT_MIN_PREV_USD = 0.10  # 지난 기간이 이보다 작으면 %는 빼고 금액 증감만(소액 % 과장 방지)
 
+
+def _fetch_provider_periods(provider_module, config_error_cls, periods) -> dict:
+    """주간/월간 요약용 제공사 조회. 합계(cost_report)와 프로젝트별(usage/costs)을 각각 방어해서
+    한쪽이 실패해도 다른 쪽은 표시된다. periods = [(이번 기간), (지난 기간)], 각 결과는 같은 순서.
+    키 미설정이면 skipped(합계 줄에 "건너뜀"이 이미 표시되므로 프로젝트별 부분은 조용히 생략)."""
+    result = {"totals": None, "total_error": None, "projects": None, "project_error": None, "skipped": False}
+    try:
+        result["totals"] = provider_module.get_cost_for_periods(periods)
+    except config_error_cls as e:
+        result["total_error"] = f"건너뜀: {e}"
+        result["skipped"] = True
+        return result
+    except Exception as e:
+        result["total_error"] = f"조회 실패: {e}"
+    try:
+        result["projects"] = provider_module.get_cost_by_project_for_periods(periods)
+    except config_error_cls:
+        result["skipped"] = True
+    except Exception as e:
+        result["project_error"] = str(e)[:150]
+    return result
+
+
+def fetch_range_costs(start, end, prev_start) -> dict[str, dict]:
+    """[start, end) 이번 기간과 [prev_start, start) 지난 기간을 제공사별로 한 번에 조회한다."""
+    periods = [(start, end), (prev_start, start)]
+    return {
+        "Anthropic": _fetch_provider_periods(anthropic_cost, anthropic_cost.AnthropicConfigError, periods),
+        "OpenAI": _fetch_provider_periods(openai_cost, openai_cost.OpenAIConfigError, periods),
+    }
+
+
+def _delta_parts(cur: float, prev: float) -> tuple[str, str | None] | None:
+    """(증감 텍스트, % 텍스트 또는 None). 지난 기간이 사실상 $0이면 ("신규", None),
+    변화가 $0.01 미만이면 None(표시 생략). 지난 기간 $0.10 미만이면 %는 생략."""
+    if prev < NEW_THRESHOLD_USD:
+        return ("신규", None) if cur >= MIN_SHOWN_USD else None
+    diff = cur - prev
+    if abs(diff) < MIN_SHOWN_USD:
+        return None
+    amount = f"{'▲' if diff > 0 else '▼'}{format_currency(abs(diff), 'USD')}"
+    pct = f"{diff / prev * 100:+.0f}%" if prev >= PCT_MIN_PREV_USD else None
+    return amount, pct
+
+
+def _format_project_delta(cur: float, prev: float) -> str:
+    """프로젝트 줄 뒤에 붙는 증감: ' ▲$0.50 (+23%)' / ' ▲$0.05' / ' (신규)' / ''."""
+    parts = _delta_parts(cur, prev)
+    if parts is None:
+        return ""
+    amount, pct = parts
+    if amount == "신규":
+        return " (신규)"
+    return f" {amount} ({pct})" if pct else f" {amount}"
+
+
+def _range_project_lines(data: dict[str, dict], compare_label: str, max_rows: int) -> list[str]:
+    """주간/월간 요약의 "프로젝트별 (전주/전월 대비)" 블록. 일일 섹션과 같은 규칙:
+    이번 기간 상위 max_rows개 + "기타", $0.01 미만 줄 숨김, 미귀속(음수는 경고).
+    지난 기간 $0.01 이상이었는데 이번 기간 $0.01 미만인 프로젝트는 "(중단)" 줄로 사용 중인
+    프로젝트 아래에 두되 max_rows 제한 안에 포함한다."""
+    if all(p["skipped"] for p in data.values()):
+        return []
+
+    errors = {name: p["project_error"] for name, p in data.items() if p["project_error"]}
+    active = {name: p for name, p in data.items() if p["projects"] is not None}
+    if not active:
+        if not errors:
+            return []
+        detail = " / ".join(f"{name}: {err}" for name, err in errors.items())
+        return [f"⚠️ 프로젝트별 조회 실패: {detail}"]
+
+    entries = []
+    unattributed = 0.0
+    for provider, p in active.items():
+        cur_rows, prev_rows = p["projects"]
+        cur_map = {r["project"]: r["cost_usd"] for r in cur_rows}
+        prev_map = {r["project"]: r["cost_usd"] for r in prev_rows}
+        for project in cur_map.keys() | prev_map.keys():
+            entries.append(
+                {"project": project, "provider": provider, "cur": cur_map.get(project, 0.0), "prev": prev_map.get(project, 0.0)}
+            )
+        if p["totals"] is not None:
+            unattributed += p["totals"][0] - sum(cur_map.values())
+
+    in_use = sorted((e for e in entries if e["cur"] >= MIN_SHOWN_USD), key=lambda e: e["cur"], reverse=True)
+    stopped = sorted(
+        (e for e in entries if e["cur"] < MIN_SHOWN_USD and e["prev"] >= MIN_SHOWN_USD),
+        key=lambda e: e["prev"], reverse=True,
+    )
+    tiny = [e for e in entries if e["cur"] < MIN_SHOWN_USD and e["prev"] < MIN_SHOWN_USD]
+    candidates = in_use + stopped
+    shown = candidates[:max_rows]
+    rest = [e for e in candidates[max_rows:] + tiny if e["cur"] > 0]  # 넘친 (중단) 줄은 "기타" 개수에서 제외
+
+    lines = [f"프로젝트별 ({compare_label} 대비)"]
+    for e in shown:
+        head = f"· {e['project']} ({e['provider']}) {format_currency(e['cur'], 'USD')}"
+        if e["cur"] < MIN_SHOWN_USD:
+            lines.append(f"{head} ▼{format_currency(e['prev'] - e['cur'], 'USD')} (중단)")
+        else:
+            lines.append(f"{head}{_format_project_delta(e['cur'], e['prev'])}")
+
+    rest_usd = sum(e["cur"] for e in rest)
+    if rest_usd >= MIN_SHOWN_USD:
+        lines.append(f"· 기타 {len(rest)}개 {format_currency(rest_usd, 'USD')}")
+
+    unattributed_line = _format_unattributed_line(unattributed)
+    if unattributed_line:
+        lines.append(unattributed_line)
+
+    if len(lines) == 1:
+        lines.append("· 사용 없음")
+
+    for name, err in errors.items():
+        lines.append(f"⚠️ {name} 프로젝트별 조회 실패: {err}")
+    return lines
+
+
+def build_range_summary_section(
+    title_emoji: str, title: str, label: str, compare_label: str, data: dict[str, dict],
+    max_rows: int = PROJECT_SECTION_MAX_ROWS,
+) -> str:
+    """주간/월간 요약 섹션(조회 없는 순수 포맷 함수). 제공사별 합계, 합계의 지난 기간 대비 증감,
+    프로젝트별 블록 순서. 합계 줄은 기존 형식을 유지하고 끝에 "(전주 대비 ▲$x, +y%)"만 붙인다."""
     lines = [f"{title_emoji} {title} ({label})"]
-    if a_error:
-        lines.append(f"· Anthropic  ⚠️ {a_error}")
-    else:
-        lines.append(f"· Anthropic  {format_currency(a_cost, 'USD')}")
-    if o_error:
-        lines.append(f"· OpenAI     ⚠️ {o_error}")
-    else:
-        lines.append(f"· OpenAI     {format_currency(o_cost, 'USD')}")
+    ok = {}
+    for name, p in data.items():
+        if p["total_error"]:
+            lines.append(f"· {PROVIDER_LABELS[name]}⚠️ {p['total_error']}")
+        else:
+            lines.append(f"· {PROVIDER_LABELS[name]}{format_currency(p['totals'][0], 'USD')}")
+            ok[name] = p["totals"]
 
-    if not a_error or not o_error:
-        note = " (일부 제공사 조회 실패, 부분 합계)" if (a_error or o_error) else ""
-        lines.append(f"· 합계        {format_currency(a_cost + o_cost, 'USD')}{note}")
+    if ok:
+        cur = sum(t[0] for t in ok.values())
+        prev = sum(t[1] for t in ok.values())
+        note = " (일부 제공사 조회 실패, 부분 합계)" if len(ok) < len(data) else ""
+        # 부분 합계끼리의 증감은 오해 소지가 있어 생략(프로젝트 줄 증감은 유지)
+        parts = None if note else _delta_parts(cur, prev)
+        delta = ""
+        if parts:
+            amount, pct = parts
+            delta = f" ({compare_label} 대비 {amount}{', ' + pct if pct else ''})"
+        lines.append(f"· 합계        {format_currency(cur, 'USD')}{note}{delta}")
 
+    lines.extend(_range_project_lines(data, compare_label, max_rows))
     return "\n".join(lines)
 
 
-def _build_weekly_section_safe(today) -> str | None:
-    """오늘이 월요일이 아니면 None(섹션 생략). 계산 중 예상 못 한 에러가 나도
-    전체 리포트는 죽지 않도록 여기서 흡수한다."""
-    if not weekly_monthly.is_monday(today):
+def _prepare_range_section(title_emoji: str, title: str, label: str, compare_label: str, start, end, prev_start):
+    """조회를 한 번 해 두고, max_rows만 바꿔 다시 포맷할 수 있는 builder를 돌려준다."""
+    data = fetch_range_costs(start, end, prev_start)
+    return _safe_builder(
+        lambda max_rows: build_range_summary_section(title_emoji, title, label, compare_label, data, max_rows),
+        f"⚠️ {title} 생성 실패",
+    )
+
+
+def _prepare_weekly_section(today, force: bool = False):
+    """오늘이 월요일이 아니면(force 제외) None(섹션 생략). 지난주(월~일)와 그 전주를 비교한다.
+    날짜 계산·조회 중 예상 못 한 에러가 나도 전체 리포트는 죽지 않도록 여기서 흡수한다."""
+    if not (weekly_monthly.is_monday(today) or force):
         return None
     try:
         start, end = weekly_monthly.last_week_range(today)
         last_day = end - timedelta(days=1)
         label = f"{start.month}/{start.day}~{last_day.month}/{last_day.day}"
-        return _build_range_summary_section("📅", "지난주 요약", label, start, end)
+        return _prepare_range_section("📅", "지난주 요약", label, "전주", start, end, start - timedelta(days=7))
     except Exception as e:
-        return f"⚠️ 지난주 요약 생성 실패: {e}"
+        return lambda max_rows: f"⚠️ 지난주 요약 생성 실패: {e}"
 
 
-def _build_monthly_section_safe(today, force: bool = False) -> str | None:
-    """오늘이 매월 1일이 아니면 None(섹션 생략). force면 날짜와 무관하게 생성(테스트용)."""
+def _prepare_monthly_section(today, force: bool = False):
+    """오늘이 매월 1일이 아니면(force 제외) None(섹션 생략). 지난달과 그 전달을 비교한다
+    (월 일수 차이는 보정하지 않음)."""
     if not (weekly_monthly.is_first_of_month(today) or force):
         return None
     try:
         start, end = weekly_monthly.last_month_range(today)
+        prev_start, _ = weekly_monthly.last_month_range(start)
         label = f"{start.year}년 {start.month}월"
-        return _build_range_summary_section("🗓️", "지난달 요약", label, start, end)
+        return _prepare_range_section("🗓️", "지난달 요약", label, "전월", start, end, prev_start)
     except Exception as e:
-        return f"⚠️ 지난달 요약 생성 실패: {e}"
+        return lambda max_rows: f"⚠️ 지난달 요약 생성 실패: {e}"
 
 
 def _format_usd_compact(amount: float) -> str:
@@ -570,12 +709,15 @@ def _build_kst_precise_section_safe(today) -> str | None:
         return f"⚠️ KST 정밀 비용(실험적) 계산 실패: {e}"
 
 
-def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[str, list]:
+def build_report(
+    dry_run: bool = False, force_monthly: bool = False, force_weekly: bool = False
+) -> tuple[str, list]:
     """
     Args:
         dry_run: True면 지난 D-3 버튼 응답 처리(텔레그램 getUpdates/확정 + Notion 기록)를
             건너뛴다 — 로컬 확인만으로 실제 응답이 소비되지 않게 하기 위함.
         force_monthly: True면 1일이 아니어도 월간 섹션(지난달 요약 + 회사/개인 구독) 생성.
+        force_weekly: True면 월요일이 아니어도 주간 섹션(지난주 요약) 생성.
 
     Returns:
         (리포트 본문 텍스트, 인라인 키보드 행 리스트) 튜플. 키보드가 빈 리스트면
@@ -600,13 +742,26 @@ def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[st
 
     sections.append(cost_text)
 
-    # 프로젝트별 섹션 — 합계 섹션 바로 아래. 메시지가 길면 아래에서 줄 수를 줄여 다시 만든다.
+    # 프로젝트 줄이 들어가는 섹션들(일일 프로젝트별, 주간, 월간)은 조회를 한 번만 하고 builder로
+    # 보관해 둔다 — 메시지가 길면 맨 아래 안전장치에서 줄 수만 줄여 다시 만든다.
+    shrinkable: list[tuple[int, object]] = []
+
+    def add_shrinkable(builder) -> None:
+        if builder is None:
+            return
+        text = builder(PROJECT_SECTION_MAX_ROWS)
+        if text:
+            shrinkable.append((len(sections), builder))
+            sections.append(text)
+
+    # 프로젝트별 섹션 — 합계 섹션 바로 아래
     project_costs = fetch_project_costs()
-    project_max_rows = PROJECT_SECTION_MAX_ROWS
-    project_text = _build_project_section_safe(project_costs, provider_yesterday, project_max_rows)
-    project_index = len(sections)
-    if project_text:
-        sections.append(project_text)
+    add_shrinkable(
+        _safe_builder(
+            lambda max_rows: build_project_section(project_costs, provider_yesterday, max_rows),
+            "⚠️ 프로젝트별 비용 조회 실패",
+        )
+    )
 
     if yesterday_total is not None or month_total is not None:
         budget_text = budget.build_budget_section_safe(yesterday_total, month_total)
@@ -623,25 +778,18 @@ def build_report(dry_run: bool = False, force_monthly: bool = False) -> tuple[st
     if d3_text:
         sections.append(d3_text)
 
-    weekly_text = _build_weekly_section_safe(today)
-    if weekly_text:
-        sections.append(weekly_text)
-
-    monthly_text = _build_monthly_section_safe(today, force_monthly)
-    if monthly_text:
-        sections.append(monthly_text)
+    add_shrinkable(_prepare_weekly_section(today, force_weekly))
+    add_shrinkable(_prepare_monthly_section(today, force_monthly))
 
     sections.extend(_build_subscription_review_sections_safe(today, force_monthly))
 
-    # 안전장치: 텔레그램 4096자 제한 전에 프로젝트 줄을 하나씩 줄인다(넘친 프로젝트는 "기타"로 합쳐짐).
-    while (
-        project_text
-        and project_max_rows > 0
-        and _telegram_length("\n\n".join(sections)) > MESSAGE_SAFE_LIMIT
-    ):
-        project_max_rows -= 1
-        project_text = _build_project_section_safe(project_costs, provider_yesterday, project_max_rows)
-        sections[project_index] = project_text
+    # 안전장치: 텔레그램 4096자 제한 전에 모든 프로젝트 목록의 줄을 하나씩 같이 줄인다
+    # (넘친 프로젝트는 "기타"로 합쳐짐).
+    max_rows = PROJECT_SECTION_MAX_ROWS
+    while shrinkable and max_rows > 0 and _telegram_length("\n\n".join(sections)) > MESSAGE_SAFE_LIMIT:
+        max_rows -= 1
+        for index, builder in shrinkable:
+            sections[index] = builder(max_rows) or ""
 
     return "\n\n".join(sections), keyboard
 
@@ -653,8 +801,11 @@ def main() -> None:
 
     _load_dotenv_if_present()
     force_monthly = os.environ.get("COSTPING_FORCE_MONTHLY") == "1"
+    force_weekly = os.environ.get("COSTPING_FORCE_WEEKLY") == "1"
     try:
-        message, keyboard = build_report(dry_run=args.dry_run, force_monthly=force_monthly)
+        message, keyboard = build_report(
+            dry_run=args.dry_run, force_monthly=force_monthly, force_weekly=force_weekly
+        )
         if args.dry_run:
             print(f"[dry-run] 발송 생략 (버튼 {len(keyboard)}행)\n" + message)
             return
